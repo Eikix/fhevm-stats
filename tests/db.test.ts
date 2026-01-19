@@ -13,6 +13,8 @@ describe("initDatabase", () => {
 
     expect(names.has("fhe_events")).toBe(true);
     expect(names.has("checkpoints")).toBe(true);
+    expect(names.has("op_buckets")).toBe(true);
+    expect(names.has("rollup_checkpoints")).toBe(true);
 
     const columns = db.prepare("PRAGMA table_info(fhe_events)").all() as Array<{ name: string }>;
     const columnNames = new Set(columns.map((column) => column.name));

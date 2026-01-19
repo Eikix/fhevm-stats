@@ -11,6 +11,7 @@
     "stats": "bun run scripts/stats.ts",
     "smoke": "bun run scripts/smoke.ts",
     "backfill:types": "bun run scripts/backfill-types.ts",
+    "rollup:ops": "bun run scripts/rollup-ops.ts",
     "serve": "bun run src/server.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",

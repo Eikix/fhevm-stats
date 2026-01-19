@@ -21,6 +21,7 @@ export type Config = {
   endBlock?: number;
   confirmations: number;
   batchSize: number;
+  catchupMaxBlocks: number;
   dbPath: string;
   mode: Mode;
   pollIntervalMs: number;
@@ -179,6 +180,16 @@ function parseNetwork(value: string | undefined): NetworkName {
   }
 }
 
+function parseNetworks(value: string | undefined): NetworkName[] {
+  if (!value) return ["sepolia", "mainnet"];
+  const raw = value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  const parsed = raw.length > 0 ? raw.map((entry) => parseNetwork(entry)) : [parseNetwork(value)];
+  return Array.from(new Set(parsed));
+}
+
 function resolveRpcUrl(env: Env, network: NetworkName): string | undefined {
   if (env.RPC_URL) return env.RPC_URL;
 
@@ -198,6 +209,26 @@ function resolveRpcUrl(env: Env, network: NetworkName): string | undefined {
 
 export function loadConfig(env: Env): Config {
   const network = parseNetwork(env.NETWORK);
+  return loadConfigForNetwork(env, network);
+}
+
+export function loadConfigs(env: Env): Config[] {
+  const networks = parseNetworks(env.NETWORK);
+  if (networks.length > 1) {
+    if (env.RPC_URL) {
+      throw new Error("RPC_URL cannot be used with multiple networks.");
+    }
+    if (env.CHAIN_ID) {
+      throw new Error("CHAIN_ID cannot be used with multiple networks.");
+    }
+    if (env.FHEVM_EXECUTOR_ADDRESS) {
+      throw new Error("FHEVM_EXECUTOR_ADDRESS cannot be used with multiple networks.");
+    }
+  }
+  return networks.map((network) => loadConfigForNetwork(env, network));
+}
+
+function loadConfigForNetwork(env: Env, network: NetworkName): Config {
   const defaults = NETWORK_DEFAULTS[network] ?? {};
   const rpcUrl = resolveRpcUrl(env, network);
   if (!rpcUrl) {
@@ -207,6 +238,7 @@ export function loadConfig(env: Env): Config {
   const chainId = parseNumber(env.CHAIN_ID, defaults.chainId);
   const confirmations = parseNumber(env.CONFIRMATIONS, 0) ?? 0;
   const batchSize = parseNumber(env.BATCH_SIZE, 1_000) ?? 1_000;
+  const catchupMaxBlocks = parseNumber(env.CATCHUP_MAX_BLOCKS, 256) ?? 256;
 
   const startBlock = parseNumber(env.START_BLOCK);
   const endBlock = parseNumber(env.END_BLOCK);
@@ -227,6 +259,7 @@ export function loadConfig(env: Env): Config {
     endBlock,
     confirmations,
     batchSize,
+    catchupMaxBlocks,
     dbPath,
     mode: parseMode(env.MODE),
     pollIntervalMs,
@@ -237,6 +270,8 @@ export function loadConfig(env: Env): Config {
 export function initDatabase(dbPath: string): Database {
   mkdirSync(dirname(dbPath), { recursive: true });
   const db = new Database(dbPath);
+  db.exec("PRAGMA journal_mode=WAL;");
+  db.exec("PRAGMA busy_timeout=5000;");
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS fhe_events (
@@ -272,6 +307,21 @@ export function initDatabase(dbPath: string): Database {
       ON fhe_events(chain_id, event_name);
 
     CREATE TABLE IF NOT EXISTS checkpoints (
+      chain_id INTEGER PRIMARY KEY,
+      last_block INTEGER NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS op_buckets (
+      chain_id INTEGER NOT NULL,
+      bucket_start INTEGER NOT NULL,
+      bucket_seconds INTEGER NOT NULL,
+      event_name TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (chain_id, bucket_start, bucket_seconds, event_name)
+    );
+
+    CREATE TABLE IF NOT EXISTS rollup_checkpoints (
       chain_id INTEGER PRIMARY KEY,
       last_block INTEGER NOT NULL,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -568,8 +618,16 @@ function resolveStartBlock(
   checkpoint: number | undefined,
   configStart: number | undefined,
   fallback: number,
+  targetEnd: number,
+  catchupMaxBlocks: number,
 ): number {
-  if (checkpoint !== undefined) return checkpoint + 1;
+  if (checkpoint !== undefined) {
+    const nextBlock = checkpoint + 1;
+    if (catchupMaxBlocks > 0 && targetEnd - checkpoint > catchupMaxBlocks) {
+      return Math.max(targetEnd - catchupMaxBlocks + 1, 0);
+    }
+    return nextBlock;
+  }
   if (configStart !== undefined) return configStart;
   return fallback;
 }
@@ -582,7 +640,26 @@ async function backfillOnce(
   targetEnd: number,
 ): Promise<void> {
   const checkpoint = readCheckpoint(statements.getCheckpoint, config.chainId);
-  const fromBlock = resolveStartBlock(checkpoint, config.startBlock, targetEnd);
+  const fromBlock = resolveStartBlock(
+    checkpoint,
+    config.startBlock,
+    targetEnd,
+    targetEnd,
+    config.catchupMaxBlocks,
+  );
+  if (
+    checkpoint !== undefined &&
+    config.catchupMaxBlocks > 0 &&
+    targetEnd - checkpoint > config.catchupMaxBlocks
+  ) {
+    console.warn("catchup limited", {
+      chainId: config.chainId,
+      checkpoint,
+      targetEnd,
+      catchupMaxBlocks: config.catchupMaxBlocks,
+      fromBlock,
+    });
+  }
 
   let cursor = fromBlock;
   while (cursor <= targetEnd) {
@@ -592,57 +669,94 @@ async function backfillOnce(
   }
 }
 
-export async function run(config: Config): Promise<void> {
-  const db = initDatabase(config.dbPath);
-  const statements = prepareStatements(db);
-  const client = createClient(config);
-
-  const rpcChainId = Number(await client.getChainId());
-  if (config.chainId !== undefined && config.chainId !== rpcChainId) {
-    throw new Error(`RPC chainId (${rpcChainId}) does not match CHAIN_ID (${config.chainId}).`);
+export async function run(configInput: Config | Config[]): Promise<void> {
+  const configs = Array.isArray(configInput) ? configInput : [configInput];
+  const dbPath = configs[0]?.dbPath ?? DEFAULT_DB_PATH;
+  for (const config of configs) {
+    if (config.dbPath !== dbPath) {
+      throw new Error("All networks must use the same DB_PATH when running together.");
+    }
   }
-  const resolvedConfig: ResolvedConfig = {
-    ...config,
-    chainId: config.chainId ?? rpcChainId,
-  };
+  const db = initDatabase(dbPath);
+  const statements = prepareStatements(db);
 
-  const executorAddress = getAddress(resolvedConfig.fhevmExecutorAddress);
+  const runtimes = await Promise.all(
+    configs.map(async (config) => {
+      const client = createClient(config);
+      const rpcChainId = Number(await client.getChainId());
+      if (config.chainId !== undefined && config.chainId !== rpcChainId) {
+        throw new Error(`RPC chainId (${rpcChainId}) does not match CHAIN_ID (${config.chainId}).`);
+      }
+      const resolvedConfig: ResolvedConfig = {
+        ...config,
+        chainId: config.chainId ?? rpcChainId,
+      };
+      const executorAddress = getAddress(resolvedConfig.fhevmExecutorAddress);
 
-  console.log("fhevm-stats config loaded", {
-    rpcUrl: resolvedConfig.rpcUrl,
-    chainId: resolvedConfig.chainId,
-    network: resolvedConfig.network,
-    fhevmExecutorAddress: executorAddress,
-    startBlock: resolvedConfig.startBlock,
-    endBlock: resolvedConfig.endBlock,
-    confirmations: resolvedConfig.confirmations,
-    batchSize: resolvedConfig.batchSize,
-    dbPath: resolvedConfig.dbPath,
-    mode: resolvedConfig.mode,
-    pollIntervalMs: resolvedConfig.pollIntervalMs,
-  });
+      console.log("fhevm-stats config loaded", {
+        rpcUrl: resolvedConfig.rpcUrl,
+        chainId: resolvedConfig.chainId,
+        network: resolvedConfig.network,
+        fhevmExecutorAddress: executorAddress,
+        startBlock: resolvedConfig.startBlock,
+        endBlock: resolvedConfig.endBlock,
+        confirmations: resolvedConfig.confirmations,
+        batchSize: resolvedConfig.batchSize,
+        catchupMaxBlocks: resolvedConfig.catchupMaxBlocks,
+        dbPath: resolvedConfig.dbPath,
+        mode: resolvedConfig.mode,
+        pollIntervalMs: resolvedConfig.pollIntervalMs,
+      });
 
-  const fetchTargetEnd = async (): Promise<number> => {
+      return { client, config: resolvedConfig, executorAddress };
+    }),
+  );
+
+  const fetchTargetEnd = async (
+    client: ReturnType<typeof createClient>,
+    config: ResolvedConfig,
+  ) => {
     const latest = Number(await client.getBlockNumber());
-    const confirmed = latest - resolvedConfig.confirmations;
+    const confirmed = latest - config.confirmations;
     return confirmed < 0 ? 0 : confirmed;
   };
 
-  if (resolvedConfig.mode === "backfill" || resolvedConfig.mode === "both") {
-    const confirmedEnd = await fetchTargetEnd();
-    const targetEnd =
-      resolvedConfig.endBlock !== undefined
-        ? Math.min(resolvedConfig.endBlock, confirmedEnd)
-        : confirmedEnd;
-    await backfillOnce(client, statements, executorAddress, resolvedConfig, targetEnd);
+  for (const runtime of runtimes) {
+    if (runtime.config.mode === "backfill" || runtime.config.mode === "both") {
+      const confirmedEnd = await fetchTargetEnd(runtime.client, runtime.config);
+      const targetEnd =
+        runtime.config.endBlock !== undefined
+          ? Math.min(runtime.config.endBlock, confirmedEnd)
+          : confirmedEnd;
+      await backfillOnce(
+        runtime.client,
+        statements,
+        runtime.executorAddress,
+        runtime.config,
+        targetEnd,
+      );
+    }
   }
 
-  if (resolvedConfig.mode === "stream" || resolvedConfig.mode === "both") {
+  const shouldStream = runtimes.some(
+    (runtime) => runtime.config.mode === "stream" || runtime.config.mode === "both",
+  );
+  if (shouldStream) {
+    const pollIntervalMs = Math.min(...runtimes.map((runtime) => runtime.config.pollIntervalMs));
     // Stream by polling the latest confirmed block.
     for (;;) {
-      const confirmedEnd = await fetchTargetEnd();
-      await backfillOnce(client, statements, executorAddress, resolvedConfig, confirmedEnd);
-      await new Promise((resolve) => setTimeout(resolve, resolvedConfig.pollIntervalMs));
+      for (const runtime of runtimes) {
+        if (runtime.config.mode !== "stream" && runtime.config.mode !== "both") continue;
+        const confirmedEnd = await fetchTargetEnd(runtime.client, runtime.config);
+        await backfillOnce(
+          runtime.client,
+          statements,
+          runtime.executorAddress,
+          runtime.config,
+          confirmedEnd,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
     }
   }
 
@@ -650,6 +764,6 @@ export async function run(config: Config): Promise<void> {
 }
 
 export async function runFromEnv(env: Env = Bun.env): Promise<void> {
-  const config = loadConfig(env);
-  await run(config);
+  const configs = loadConfigs(env);
+  await run(configs);
 }

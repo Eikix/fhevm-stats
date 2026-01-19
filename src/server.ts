@@ -7,6 +7,7 @@ const dbPath = Bun.env.DB_PATH ?? DEFAULT_DB_PATH;
 const defaultChainId = parseNumber(Bun.env.CHAIN_ID);
 const port = parseNumber(Bun.env.HTTP_PORT, DEFAULT_PORT) ?? DEFAULT_PORT;
 const db = new Database(dbPath, { readonly: true });
+db.exec("PRAGMA busy_timeout=5000;");
 
 type Filters = {
   chainId?: number;
@@ -28,7 +29,7 @@ const TYPE_COLUMNS: Record<string, string> = {
 };
 
 function parseNumber(value: string | null | undefined, fallback?: number): number | undefined {
-  if (value === undefined || value === "") return fallback;
+  if (value === undefined || value === null || value === "") return fallback;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
 }
@@ -42,19 +43,19 @@ function buildWhereClause(filters: Filters): {
 
   if (filters.chainId !== undefined) {
     clauses.push("chain_id = $chainId");
-    params.chainId = filters.chainId;
+    params.$chainId = filters.chainId;
   }
   if (filters.startBlock !== undefined) {
     clauses.push("block_number >= $startBlock");
-    params.startBlock = filters.startBlock;
+    params.$startBlock = filters.startBlock;
   }
   if (filters.endBlock !== undefined) {
     clauses.push("block_number <= $endBlock");
-    params.endBlock = filters.endBlock;
+    params.$endBlock = filters.endBlock;
   }
   if (filters.eventName) {
     clauses.push("event_name = $eventName");
-    params.eventName = filters.eventName;
+    params.$eventName = filters.eventName;
   }
 
   if (clauses.length === 0) return { clause: "", params };
@@ -81,6 +82,23 @@ function parseFilters(url: URL): Filters {
 
 function handleHealth(): Response {
   return jsonResponse({ status: "ok", dbPath, defaultChainId, port });
+}
+
+function handleDbStats(): Response {
+  const totalRow = db.prepare("SELECT COUNT(*) AS count FROM fhe_events").get() as {
+    count: number;
+  };
+  const sizeRow = db
+    .prepare(
+      "SELECT page_count * page_size AS sizeBytes FROM pragma_page_count(), pragma_page_size()",
+    )
+    .get() as { sizeBytes: number };
+
+  return jsonResponse({
+    dbPath,
+    events: totalRow.count,
+    sizeBytes: sizeRow.sizeBytes,
+  });
 }
 
 function handleOps(url: URL): Response {
@@ -128,7 +146,7 @@ function handleBuckets(url: URL): Response {
        GROUP BY bucketStart
        ORDER BY bucketStart`,
     )
-    .all({ ...params, bucketSize }) as Array<{ bucketStart: number; count: number }>;
+    .all({ ...params, $bucketSize: bucketSize }) as Array<{ bucketStart: number; count: number }>;
 
   return jsonResponse({ filters, bucketSize, rows });
 }
@@ -179,11 +197,20 @@ Bun.serve({
         return handleBuckets(url);
       case "/stats/types":
         return handleTypes(url);
+      case "/stats/db":
+        return handleDbStats();
       default:
         return jsonResponse(
           {
             error: "not_found",
-            routes: ["/health", "/stats/summary", "/stats/ops", "/stats/buckets", "/stats/types"],
+            routes: [
+              "/health",
+              "/stats/summary",
+              "/stats/ops",
+              "/stats/buckets",
+              "/stats/types",
+              "/stats/db",
+            ],
           },
           404,
         );
