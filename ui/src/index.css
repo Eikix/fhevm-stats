@@ -1,0 +1,105 @@
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap");
+@import "tailwindcss";
+
+:root {
+  color-scheme: light;
+  --bg: #f6f1e7;
+  --bg-tint: #efe7d6;
+  --ink: #1f1b16;
+  --muted: #5e5a51;
+  --accent: #0f766e;
+  --accent-strong: #0b4f4a;
+  --glow: rgba(15, 118, 110, 0.22);
+  --card: rgba(255, 255, 255, 0.72);
+  --stroke: rgba(31, 27, 22, 0.12);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: "Space Grotesk", system-ui, sans-serif;
+  color: var(--ink);
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(circle at 15% 15%, rgba(15, 118, 110, 0.18), transparent 45%),
+    radial-gradient(circle at 85% 10%, rgba(217, 119, 6, 0.16), transparent 48%),
+    linear-gradient(rgba(31, 27, 22, 0.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(31, 27, 22, 0.06) 1px, transparent 1px);
+  background-size:
+    auto,
+    auto,
+    48px 48px,
+    48px 48px;
+  background-position: 0 0;
+  background-attachment: fixed;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+::selection {
+  background: rgba(15, 118, 110, 0.25);
+}
+
+@layer base {
+  h1,
+  h2,
+  h3 {
+    letter-spacing: -0.02em;
+  }
+}
+
+@layer utilities {
+  .font-display {
+    font-family: "Space Grotesk", system-ui, sans-serif;
+  }
+
+  .font-code {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  .glass-panel {
+    background: var(--card);
+    border: 1px solid var(--stroke);
+    box-shadow: 0 20px 60px -40px rgba(15, 118, 110, 0.45);
+    backdrop-filter: blur(10px);
+  }
+
+  .muted-text {
+    color: var(--muted);
+  }
+
+  .glow-ring {
+    box-shadow:
+      0 0 0 1px var(--stroke),
+      0 12px 30px -20px var(--glow);
+  }
+
+  .fade-in-up {
+    animation: fadeInUp 800ms ease both;
+  }
+}
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fade-in-up {
+    animation: none;
+  }
+}
