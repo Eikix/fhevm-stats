@@ -18,6 +18,10 @@ function toBucketStart(timestamp: bigint, bucketSeconds: number): number {
   return Math.floor(seconds / bucketSeconds) * bucketSeconds;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function main(): Promise<void> {
   const env = { ...Bun.env } as Record<string, string | undefined>;
   const config = loadConfig(env);
@@ -72,6 +76,10 @@ async function main(): Promise<void> {
   }
 
   const blockBatch = parseNumber(env.ROLLUP_BLOCK_BATCH, 5_000) ?? 5_000;
+  const fetchDelayMs = parseNumber(env.ROLLUP_BLOCK_FETCH_DELAY_MS, 200) ?? 200;
+  if (fetchDelayMs < 0) {
+    throw new Error("ROLLUP_BLOCK_FETCH_DELAY_MS must be >= 0.");
+  }
   const selectRows = db.prepare(`
     SELECT block_number AS blockNumber, event_name AS eventName, COUNT(*) AS count
     FROM fhe_events
@@ -118,12 +126,13 @@ async function main(): Promise<void> {
 
     if (missingBlocks.length > 0) {
       const uniqueBlocks = Array.from(new Set(missingBlocks));
-      await Promise.all(
-        uniqueBlocks.map(async (blockNumber) => {
-          const block = await client.getBlock({ blockNumber: BigInt(blockNumber) });
-          bucketCache.set(blockNumber, toBucketStart(block.timestamp, bucketSeconds));
-        }),
-      );
+      for (const blockNumber of uniqueBlocks) {
+        const block = await client.getBlock({ blockNumber: BigInt(blockNumber) });
+        bucketCache.set(blockNumber, toBucketStart(block.timestamp, bucketSeconds));
+        if (fetchDelayMs > 0) {
+          await sleep(fetchDelayMs);
+        }
+      }
     }
 
     const grouped = new Map<string, { bucketStart: number; eventName: string; count: number }>();

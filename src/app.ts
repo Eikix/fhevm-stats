@@ -326,6 +326,104 @@ export function initDatabase(dbPath: string): Database {
       last_block INTEGER NOT NULL,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS dfg_txs (
+      chain_id INTEGER NOT NULL,
+      tx_hash TEXT NOT NULL,
+      block_number INTEGER NOT NULL,
+      node_count INTEGER NOT NULL,
+      edge_count INTEGER NOT NULL,
+      depth INTEGER NOT NULL,
+      signature_hash TEXT,
+      stats_json TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (chain_id, tx_hash)
+    );
+    CREATE INDEX IF NOT EXISTS dfg_txs_block
+      ON dfg_txs(chain_id, block_number);
+
+    CREATE TABLE IF NOT EXISTS dfg_nodes (
+      chain_id INTEGER NOT NULL,
+      tx_hash TEXT NOT NULL,
+      node_id INTEGER NOT NULL,
+      op TEXT NOT NULL,
+      output_handle TEXT,
+      input_count INTEGER NOT NULL,
+      scalar_flag INTEGER,
+      type_info_json TEXT,
+      PRIMARY KEY (chain_id, tx_hash, node_id)
+    );
+    CREATE INDEX IF NOT EXISTS dfg_nodes_tx
+      ON dfg_nodes(chain_id, tx_hash);
+    CREATE INDEX IF NOT EXISTS dfg_nodes_output_handle
+      ON dfg_nodes(chain_id, output_handle);
+
+    CREATE TABLE IF NOT EXISTS dfg_edges (
+      chain_id INTEGER NOT NULL,
+      tx_hash TEXT NOT NULL,
+      from_node_id INTEGER NOT NULL,
+      to_node_id INTEGER NOT NULL,
+      input_handle TEXT NOT NULL,
+      PRIMARY KEY (chain_id, tx_hash, from_node_id, to_node_id, input_handle)
+    );
+    CREATE INDEX IF NOT EXISTS dfg_edges_tx
+      ON dfg_edges(chain_id, tx_hash);
+
+    CREATE TABLE IF NOT EXISTS dfg_inputs (
+      chain_id INTEGER NOT NULL,
+      tx_hash TEXT NOT NULL,
+      handle TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      PRIMARY KEY (chain_id, tx_hash, handle)
+    );
+    CREATE INDEX IF NOT EXISTS dfg_inputs_tx
+      ON dfg_inputs(chain_id, tx_hash);
+    CREATE INDEX IF NOT EXISTS dfg_inputs_handle
+      ON dfg_inputs(chain_id, handle);
+
+    CREATE TABLE IF NOT EXISTS dfg_handle_producers (
+      chain_id INTEGER NOT NULL,
+      handle TEXT NOT NULL,
+      tx_hash TEXT NOT NULL,
+      block_number INTEGER NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (chain_id, handle)
+    );
+    CREATE INDEX IF NOT EXISTS dfg_handle_producers_tx
+      ON dfg_handle_producers(chain_id, tx_hash);
+
+    CREATE TABLE IF NOT EXISTS dfg_tx_deps (
+      chain_id INTEGER NOT NULL,
+      tx_hash TEXT NOT NULL,
+      block_number INTEGER NOT NULL,
+      upstream_txs INTEGER NOT NULL,
+      handle_links INTEGER NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (chain_id, tx_hash)
+    );
+    CREATE INDEX IF NOT EXISTS dfg_tx_deps_block
+      ON dfg_tx_deps(chain_id, block_number, tx_hash);
+
+    CREATE TABLE IF NOT EXISTS dfg_rollups (
+      chain_id INTEGER PRIMARY KEY,
+      dfg_tx_count INTEGER NOT NULL,
+      stats_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS dfg_dep_rollups (
+      chain_id INTEGER PRIMARY KEY,
+      dfg_tx_count INTEGER NOT NULL,
+      stats_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS dfg_rollup_checkpoints (
+      chain_id INTEGER PRIMARY KEY,
+      last_block INTEGER,
+      last_tx_hash TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
 
   ensureEventColumns(db);
@@ -538,6 +636,19 @@ export function validateDerivedTypes(
 
 const FHE_EVENTS = FHE_EVENTS_ABI.filter((item) => item.type === "event") as AbiEvent[];
 
+function isInvalidBlockRangeError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const record = err as Record<string, unknown>;
+  const message = typeof record.message === "string" ? record.message : "";
+  const details = typeof record.details === "string" ? record.details : "";
+  const shortMessage = typeof record.shortMessage === "string" ? record.shortMessage : "";
+  return (
+    message.includes("invalid block range") ||
+    details.includes("invalid block range") ||
+    shortMessage.includes("invalid block range")
+  );
+}
+
 async function processRange(
   client: ReturnType<typeof createClient>,
   statements: ReturnType<typeof prepareStatements>,
@@ -548,12 +659,25 @@ async function processRange(
 ): Promise<void> {
   if (fromBlock > toBlock) return;
 
-  const logs = await client.getLogs({
-    address: executorAddress,
-    fromBlock: BigInt(fromBlock),
-    toBlock: BigInt(toBlock),
-    events: FHE_EVENTS,
-  });
+  let logs: Awaited<ReturnType<typeof client.getLogs>>;
+  try {
+    logs = await client.getLogs({
+      address: executorAddress,
+      fromBlock: BigInt(fromBlock),
+      toBlock: BigInt(toBlock),
+      events: FHE_EVENTS,
+    });
+  } catch (err) {
+    if (fromBlock === toBlock && isInvalidBlockRangeError(err)) {
+      console.warn("getLogs rejected block range; will retry next poll", {
+        chainId,
+        fromBlock,
+        toBlock,
+      });
+      return;
+    }
+    throw err;
+  }
 
   let mismatchCount = 0;
   for (const log of logs) {
