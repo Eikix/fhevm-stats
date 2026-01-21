@@ -380,6 +380,10 @@ function App() {
   const [dfgStatus, setDfgStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [dfgError, setDfgError] = useState<string | null>(null);
   const [dfgSelection, setDfgSelection] = useState<string | null>(null);
+  const dfgSelectionRef = useRef<string | null>(null);
+  useEffect(() => {
+    dfgSelectionRef.current = dfgSelection;
+  }, [dfgSelection]);
   const [dfgQuery, setDfgQuery] = useState("");
   const [dfgDetail, setDfgDetail] = useState<DfgTxResponse | null>(null);
   const [dfgDetailStatus, setDfgDetailStatus] = useState<"idle" | "loading" | "ready" | "error">(
@@ -460,11 +464,11 @@ function App() {
     return () => controller.abort();
   }, [chainId, refreshKey]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: refreshKey is intentional trigger for manual refresh
   useEffect(() => {
     const controller = new AbortController();
     const params = new URLSearchParams();
     params.set("chainId", chainId.toString());
+    params.set("cacheBust", refreshKey.toString());
 
     setIngestionStatus("loading");
     setIngestionError(null);
@@ -526,7 +530,6 @@ function App() {
     return () => controller.abort();
   }, [chainId, refreshKey, opTypeRole]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: dfgSelection read for comparison only; adding it causes infinite loop
   useEffect(() => {
     const controller = new AbortController();
     const cacheBust = refreshKey;
@@ -553,7 +556,7 @@ function App() {
         setDfgTotal(response.total ?? rows.length);
         setDfgStatus("ready");
         if (rows.length > 0) {
-          const current = dfgSelection;
+          const current = dfgSelectionRef.current;
           const exists = current ? rows.some((row) => row.txHash === current) : false;
           if (!exists) {
             setDfgSelection(rows[0].txHash);
@@ -569,7 +572,6 @@ function App() {
 
     load();
     return () => controller.abort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chainId, refreshKey, dfgSignatureSelection]);
 
   useEffect(() => {
