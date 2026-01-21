@@ -400,6 +400,7 @@ export function initDatabase(dbPath: string): Database {
       upstream_txs INTEGER NOT NULL,
       handle_links INTEGER NOT NULL,
       chain_depth INTEGER NOT NULL DEFAULT 0,
+      total_depth INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       PRIMARY KEY (chain_id, tx_hash)
     );
@@ -469,6 +470,9 @@ function ensureDfgColumns(db: Database): void {
   const depsExisting = new Set(depsCols.map((row) => row.name));
   if (!depsExisting.has("chain_depth")) {
     db.exec("ALTER TABLE dfg_tx_deps ADD COLUMN chain_depth INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!depsExisting.has("total_depth")) {
+    db.exec("ALTER TABLE dfg_tx_deps ADD COLUMN total_depth INTEGER NOT NULL DEFAULT 0");
   }
 }
 

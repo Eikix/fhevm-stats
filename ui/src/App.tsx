@@ -3,6 +3,7 @@ import {
   type FormEvent,
   type MouseEvent,
   type WheelEvent,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -85,6 +86,7 @@ type DfgStatsResponse = {
   };
   totalTxs: number;
   coverage: number;
+  maxDepsBlock: number | null;
   deps: {
     totalTxs: number;
     dependentTxs: number;
@@ -95,7 +97,15 @@ type DfgStatsResponse = {
     maxUpstreamHandles: number;
     parallelismRatio: number;
     maxChainDepth: number;
+    maxTotalDepth: number;
     chainDepthDistribution: Record<number, number>;
+    totalDepthDistribution: Record<number, number>;
+    depthMode?: "inter" | "total";
+    horizon?: {
+      startBlock: number;
+      endBlock: number;
+      blockCount: number;
+    };
   } | null;
 };
 
@@ -167,6 +177,42 @@ type OpTypeRow = {
 type OpTypesResponse = {
   rows: OpTypeRow[];
   totals?: Array<{ eventName: string; count: number }>;
+};
+
+type ChunkStats = {
+  startBlock: number;
+  endBlock: number;
+  totalTxs: number;
+  dependentTxs: number;
+  independentTxs: number;
+  parallelismRatio: number;
+  maxChainDepth: number;
+  maxTotalDepth: number;
+  avgChainDepth: number;
+  avgTotalDepth: number;
+};
+
+type ChunksResponse = {
+  chainId: number;
+  chunkSize: number;
+  signatureHash?: string;
+  chunks: ChunkStats[];
+};
+
+type SignatureDepStats = {
+  signatureHash: string;
+  txCount: number;
+  dependentTxs: number;
+  parallelismRatio: number;
+  avgChainDepth: number;
+  avgTotalDepth: number;
+  maxChainDepth: number;
+  maxTotalDepth: number;
+};
+
+type BySignatureResponse = {
+  chainId: number;
+  signatures: SignatureDepStats[];
 };
 
 type NetworkOption = {
@@ -412,6 +458,26 @@ function App() {
     "idle",
   );
   const [dfgDepsError, setDfgDepsError] = useState<string | null>(null);
+  const [horizonMode, setHorizonMode] = useState<"all" | "block" | "range">("all");
+  const [horizonBlocks, setHorizonBlocks] = useState(10);
+  const [depthMode, setDepthMode] = useState<"inter" | "total">("inter");
+  const depsLoadedOnceRef = useRef(false);
+
+  // View mode: single range vs rolling chunks
+  const [depsViewMode, setDepsViewMode] = useState<"single" | "chunks">("single");
+
+  // Chunk settings
+  const [chunkSize, setChunkSize] = useState(100);
+  const [chunksData, setChunksData] = useState<ChunkStats[]>([]);
+  const [chunksStatus, setChunksStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [chunksError, setChunksError] = useState<string | null>(null);
+
+  // Pattern filter
+  const [signatureFilter, setSignatureFilter] = useState<string | null>(null);
+  const [signatureOptions, setSignatureOptions] = useState<SignatureDepStats[]>([]);
+  const [signatureOptionsStatus, setSignatureOptionsStatus] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle");
   const [dfgRollup, setDfgRollup] = useState<DfgRollupResponse | null>(null);
   const [dfgRollupStatus, setDfgRollupStatus] = useState<"idle" | "loading" | "ready" | "error">(
     "idle",
@@ -650,13 +716,34 @@ function App() {
     return () => controller.abort();
   }, [chainId, refreshKey]);
 
-  const loadDfgDeps = () => {
+  const loadDfgDeps = useCallback(() => {
     if (dfgDepsStatus === "loading") return;
     const controller = new AbortController();
     const params = new URLSearchParams();
     params.set("chainId", chainId.toString());
     params.set("includeDeps", "1");
+    params.set("depthMode", depthMode);
     params.set("cacheBust", refreshKey.toString());
+
+    // Apply horizon filter - use maxDepsBlock (latest block with dependency data)
+    const maxBlock = dfgStats?.maxDepsBlock;
+    if (horizonMode !== "all" && maxBlock !== null && maxBlock !== undefined) {
+      if (horizonMode === "block") {
+        // Single latest block with data
+        params.set("startBlock", maxBlock.toString());
+        params.set("endBlock", maxBlock.toString());
+      } else if (horizonMode === "range") {
+        // Last N blocks with data
+        const startBlock = Math.max(0, maxBlock - horizonBlocks + 1);
+        params.set("startBlock", startBlock.toString());
+        params.set("endBlock", maxBlock.toString());
+      }
+    }
+
+    // Pattern filter
+    if (signatureFilter) {
+      params.set("signatureHash", signatureFilter);
+    }
 
     setDfgDepsStatus("loading");
     setDfgDepsError(null);
@@ -664,13 +751,99 @@ function App() {
       .then((response) => {
         setDfgDeps(response.deps ?? null);
         setDfgDepsStatus("ready");
+        depsLoadedOnceRef.current = true;
       })
       .catch((err) => {
         if (err instanceof Error && err.name === "AbortError") return;
         setDfgDepsError(err instanceof Error ? err.message : "Failed to load dependency stats.");
         setDfgDepsStatus("error");
       });
-  };
+  }, [
+    chainId,
+    depthMode,
+    dfgDepsStatus,
+    dfgStats?.maxDepsBlock,
+    horizonBlocks,
+    horizonMode,
+    refreshKey,
+    signatureFilter,
+  ]);
+
+  // Load chunks data for rolling view
+  const loadChunks = useCallback(() => {
+    if (chunksStatus === "loading") return;
+    const controller = new AbortController();
+    const params = new URLSearchParams();
+    params.set("chainId", chainId.toString());
+    params.set("chunkSize", chunkSize.toString());
+    params.set("limit", "50");
+    params.set("cacheBust", refreshKey.toString());
+
+    if (signatureFilter) {
+      params.set("signatureHash", signatureFilter);
+    }
+
+    setChunksStatus("loading");
+    setChunksError(null);
+    fetchJson<ChunksResponse>(
+      `${API_BASE}/dfg/stats/chunks?${params.toString()}`,
+      controller.signal,
+    )
+      .then((response) => {
+        setChunksData(response.chunks ?? []);
+        setChunksStatus("ready");
+      })
+      .catch((err) => {
+        if (err instanceof Error && err.name === "AbortError") return;
+        setChunksError(err instanceof Error ? err.message : "Failed to load chunks.");
+        setChunksStatus("error");
+      });
+  }, [chainId, chunkSize, chunksStatus, refreshKey, signatureFilter]);
+
+  // Load signature options for pattern dropdown
+  useEffect(() => {
+    const controller = new AbortController();
+    const params = new URLSearchParams();
+    params.set("chainId", chainId.toString());
+    params.set("limit", "50");
+    params.set("cacheBust", refreshKey.toString());
+
+    setSignatureOptionsStatus("loading");
+    fetchJson<BySignatureResponse>(
+      `${API_BASE}/dfg/stats/by-signature?${params.toString()}`,
+      controller.signal,
+    )
+      .then((response) => {
+        setSignatureOptions(response.signatures ?? []);
+        setSignatureOptionsStatus("ready");
+      })
+      .catch((err) => {
+        if (err instanceof Error && err.name === "AbortError") return;
+        setSignatureOptionsStatus("error");
+      });
+
+    return () => controller.abort();
+  }, [chainId, refreshKey]);
+
+  // Auto-reload dependency stats when horizon, depth mode, or signature filter changes (only if already loaded)
+  const horizonModeRef = useRef(horizonMode);
+  const horizonBlocksRef = useRef(horizonBlocks);
+  const depthModeRef = useRef(depthMode);
+  const signatureFilterRef = useRef(signatureFilter);
+  useEffect(() => {
+    const changed =
+      horizonModeRef.current !== horizonMode ||
+      horizonBlocksRef.current !== horizonBlocks ||
+      depthModeRef.current !== depthMode ||
+      signatureFilterRef.current !== signatureFilter;
+    horizonModeRef.current = horizonMode;
+    horizonBlocksRef.current = horizonBlocks;
+    depthModeRef.current = depthMode;
+    signatureFilterRef.current = signatureFilter;
+    if (changed && depsLoadedOnceRef.current && depsViewMode === "single") {
+      loadDfgDeps();
+    }
+  }, [horizonMode, horizonBlocks, depthMode, signatureFilter, loadDfgDeps, depsViewMode]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1448,146 +1621,500 @@ function App() {
 
           {dfgStatsStatus === "ready" ? (
             <div className="mt-6 rounded-2xl border border-black/10 bg-white/70 p-4">
-              <p className="muted-text text-xs uppercase tracking-[0.3em]">Tx dependencies</p>
-              <div className="mt-3 flex flex-wrap items-center gap-3">
-                <button
-                  type="button"
-                  onClick={loadDfgDeps}
-                  disabled={dfgDepsStatus === "loading"}
-                  className="rounded-full border border-black/10 bg-white px-4 py-2 text-xs uppercase tracking-[0.2em] text-black/70 transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {dfgDepsStatus === "loading"
-                    ? "Loading..."
-                    : dfgDeps
-                      ? "Refresh dependency stats"
-                      : "Load dependency stats"}
-                </button>
-                {dfgDepsStatus === "error" ? (
-                  <span className="text-xs text-red-600">{dfgDepsError ?? "Failed to load."}</span>
-                ) : null}
+              {/* Header with view mode toggle */}
+              <div className="flex items-center justify-between gap-3 mb-3">
+                <p className="muted-text group relative inline-flex items-center gap-1 text-xs uppercase tracking-[0.3em]">
+                  Tx dependencies
+                  <span className="cursor-help text-black/30 hover:text-black/50">ⓘ</span>
+                  <span className="pointer-events-none absolute left-0 top-full z-10 mt-1 w-72 rounded bg-black/80 px-2 py-1.5 text-[10px] normal-case tracking-normal text-white opacity-0 transition-opacity group-hover:opacity-100">
+                    Dependencies between transactions. "Tx hops" = chain of tx dependencies. "Total
+                    ops" = tx hops + FHE operations within each tx (full critical path).
+                  </span>
+                </p>
+
+                {/* View mode toggle */}
+                <div className="flex gap-1 rounded-lg bg-black/5 p-1">
+                  <button
+                    type="button"
+                    onClick={() => setDepsViewMode("single")}
+                    className={`rounded px-2 py-1 text-xs transition ${depsViewMode === "single" ? "bg-white shadow" : "hover:bg-white/50"}`}
+                  >
+                    Single range
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDepsViewMode("chunks")}
+                    className={`rounded px-2 py-1 text-xs transition ${depsViewMode === "chunks" ? "bg-white shadow" : "hover:bg-white/50"}`}
+                  >
+                    Rolling chunks
+                  </button>
+                </div>
               </div>
-              {dfgDeps ? (
+
+              {/* Pattern filter dropdown */}
+              <div className="flex items-center gap-2 mb-3">
+                <label htmlFor="pattern-filter" className="text-xs text-black/60">
+                  Pattern:
+                </label>
+                <select
+                  id="pattern-filter"
+                  value={signatureFilter ?? ""}
+                  onChange={(e) => setSignatureFilter(e.target.value || null)}
+                  className="text-xs border border-black/10 rounded px-2 py-1 bg-white"
+                >
+                  <option value="">All signatures</option>
+                  {signatureOptions.map((sig) => (
+                    <option key={sig.signatureHash} value={sig.signatureHash}>
+                      {shortenHandle(sig.signatureHash, 8, 4)} ({sig.txCount} txs)
+                    </option>
+                  ))}
+                </select>
+                {signatureOptionsStatus === "loading" && (
+                  <span className="text-xs text-black/40">Loading...</span>
+                )}
+              </div>
+
+              {/* Single range view */}
+              {depsViewMode === "single" ? (
                 <>
-                  <div className="mt-4 grid gap-3 md:grid-cols-3">
-                    {[
-                      {
-                        label: "Parallelism",
-                        value: formatPercent(dfgDeps.parallelismRatio * 100),
-                        detail: "Independent / total txs",
-                      },
-                      {
-                        label: "Max chain depth",
-                        value: formatNumber(dfgDeps.maxChainDepth),
-                        detail: "Longest dependency path",
-                      },
-                      {
-                        label: "Independent txs",
-                        value: formatNumber(dfgDeps.independentTxs),
-                        detail: "Chain depth = 0",
-                      },
-                    ].map((card) => (
-                      <div
-                        key={card.label}
-                        className="rounded-2xl border border-black/5 bg-white/70 p-4"
+                  <div className="flex flex-wrap items-center gap-3">
+                    {/* Horizon filter */}
+                    <div className="flex items-center gap-2">
+                      <span className="muted-text text-xs">Horizon:</span>
+                      <select
+                        value={horizonMode}
+                        onChange={(e) =>
+                          setHorizonMode(e.target.value as "all" | "block" | "range")
+                        }
+                        className="rounded border border-black/10 bg-white px-2 py-1 text-xs"
                       >
-                        <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
-                          {card.label}
-                        </p>
-                        <p className="font-code mt-2 text-lg">{card.value}</p>
-                        <p className="muted-text mt-2 text-xs uppercase tracking-[0.18em]">
-                          {card.detail}
-                        </p>
-                      </div>
-                    ))}
-                  </div>
-                  <div className="mt-4 grid gap-3 md:grid-cols-4">
-                    {[
-                      {
-                        label: "Dependent txs",
-                        value: formatNumber(dfgDeps.dependentTxs),
-                        detail:
-                          dfgDeps.totalTxs > 0
-                            ? `${formatPercent(
-                                (dfgDeps.dependentTxs / dfgDeps.totalTxs) * 100,
-                              )} of DFG txs`
-                            : "—",
-                      },
-                      {
-                        label: "Avg upstream txs",
-                        value: formatDecimal(dfgDeps.avgUpstreamTxs, 2),
-                        detail: "Per dependent tx",
-                      },
-                      {
-                        label: "Avg upstream handles",
-                        value: formatDecimal(dfgDeps.avgUpstreamHandles, 2),
-                        detail: "Per dependent tx",
-                      },
-                      {
-                        label: "Total txs",
-                        value: formatNumber(dfgDeps.totalTxs),
-                        detail: "With dependency data",
-                      },
-                    ].map((card) => (
-                      <div
-                        key={card.label}
-                        className="rounded-2xl border border-black/5 bg-white/70 p-4"
+                        <option value="all">All time</option>
+                        <option value="block">Latest block</option>
+                        <option value="range">Last N blocks</option>
+                      </select>
+                      {horizonMode === "range" && (
+                        <input
+                          type="number"
+                          value={horizonBlocks}
+                          onChange={(e) =>
+                            setHorizonBlocks(
+                              Math.max(1, Math.min(10000, Number(e.target.value) || 1)),
+                            )
+                          }
+                          min={1}
+                          max={10000}
+                          className="w-20 rounded border border-black/10 bg-white px-2 py-1 text-xs"
+                        />
+                      )}
+                    </div>
+                    {/* Depth mode toggle */}
+                    <div className="flex gap-1 rounded-lg bg-black/5 p-1">
+                      <button
+                        type="button"
+                        onClick={() => setDepthMode("inter")}
+                        className={`rounded px-3 py-1 text-xs transition ${depthMode === "inter" ? "bg-white shadow" : "hover:bg-white/50"}`}
                       >
-                        <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
-                          {card.label}
-                        </p>
-                        <p className="font-code mt-2 text-lg">{card.value}</p>
-                        <p className="muted-text mt-2 text-xs uppercase tracking-[0.18em]">
-                          {card.detail}
-                        </p>
-                      </div>
-                    ))}
+                        Tx hops
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setDepthMode("total")}
+                        className={`rounded px-3 py-1 text-xs transition ${depthMode === "total" ? "bg-white shadow" : "hover:bg-white/50"}`}
+                      >
+                        Total ops
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={loadDfgDeps}
+                      disabled={dfgDepsStatus === "loading"}
+                      className="rounded-full border border-black/10 bg-white px-4 py-2 text-xs uppercase tracking-[0.2em] text-black/70 transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {dfgDepsStatus === "loading"
+                        ? "Loading..."
+                        : dfgDeps
+                          ? "Refresh"
+                          : "Load stats"}
+                    </button>
+                    {dfgDepsStatus === "error" ? (
+                      <span className="text-xs text-red-600">
+                        {dfgDepsError ?? "Failed to load."}
+                      </span>
+                    ) : null}
                   </div>
-                  {dfgDeps.chainDepthDistribution &&
-                    Object.keys(dfgDeps.chainDepthDistribution).length > 0 && (
-                      <div className="mt-4 rounded-2xl border border-black/5 bg-white/70 p-4">
-                        <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
-                          Chain depth distribution
-                        </p>
-                        <div className="mt-3 flex items-end gap-1" style={{ height: "80px" }}>
-                          {(() => {
-                            const entries = Object.entries(dfgDeps.chainDepthDistribution)
-                              .map(([k, v]) => ({ depth: Number(k), count: v }))
-                              .sort((a, b) => a.depth - b.depth);
-                            const maxCount = Math.max(...entries.map((e) => e.count), 1);
-                            return entries.map((entry) => (
-                              <div
-                                key={entry.depth}
-                                className="flex flex-1 flex-col items-center"
-                                title={`Depth ${entry.depth}: ${formatNumber(entry.count)} txs`}
-                              >
-                                <div
-                                  className="w-full rounded-t bg-black/20"
-                                  style={{
-                                    height: `${Math.max((entry.count / maxCount) * 100, 4)}%`,
-                                    minHeight: "4px",
-                                  }}
-                                />
-                                <span className="font-code mt-1 text-[10px] text-black/50">
-                                  {entry.depth}
-                                </span>
-                              </div>
-                            ));
-                          })()}
+                  {dfgDeps?.horizon && (
+                    <p className="muted-text mt-2 text-xs">
+                      Showing blocks {formatNumber(dfgDeps.horizon.startBlock)} -{" "}
+                      {formatNumber(dfgDeps.horizon.endBlock)} (
+                      {formatNumber(dfgDeps.horizon.blockCount)} block
+                      {dfgDeps.horizon.blockCount !== 1 ? "s" : ""})
+                    </p>
+                  )}
+                  {dfgDeps ? (
+                    <>
+                      {/* Side-by-side depth comparison */}
+                      <div className="mt-4 grid gap-3 md:grid-cols-2">
+                        <div className="rounded-2xl border border-black/5 bg-white/70 p-4">
+                          <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
+                            Max chain depth
+                          </p>
+                          <p className="font-code mt-2 text-3xl">
+                            {formatNumber(dfgDeps.maxChainDepth)}
+                          </p>
+                          <p className="muted-text mt-2 text-xs">Tx hops only</p>
                         </div>
-                        <p className="muted-text mt-2 text-center text-[10px]">
-                          Chain depth (0 = parallel, higher = more sequential)
-                        </p>
+                        <div className="rounded-2xl border border-black/5 bg-white/70 p-4">
+                          <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
+                            Max total depth
+                          </p>
+                          <p className="font-code mt-2 text-3xl">
+                            {formatNumber(dfgDeps.maxTotalDepth)}
+                          </p>
+                          <p className="muted-text mt-2 text-xs">
+                            Full critical path (tx hops + all FHE ops)
+                          </p>
+                        </div>
                       </div>
-                    )}
-                  <p className="muted-text mt-3 text-xs">
-                    Chain depth excludes trivial encrypts. Parallelism ratio = independent txs /
-                    total txs.
-                  </p>
+                      <div className="mt-4 grid gap-3 md:grid-cols-3">
+                        {[
+                          {
+                            label: "Parallelism",
+                            value: formatPercent(dfgDeps.parallelismRatio * 100),
+                            detail: "Independent / total txs",
+                          },
+                          {
+                            label: "Independent txs",
+                            value: formatNumber(dfgDeps.independentTxs),
+                            detail: "Chain depth = 0",
+                          },
+                          {
+                            label: "Total txs",
+                            value: formatNumber(dfgDeps.totalTxs),
+                            detail: "With dependency data",
+                          },
+                        ].map((card) => (
+                          <div
+                            key={card.label}
+                            className="rounded-2xl border border-black/5 bg-white/70 p-4"
+                          >
+                            <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
+                              {card.label}
+                            </p>
+                            <p className="font-code mt-2 text-lg">{card.value}</p>
+                            <p className="muted-text mt-2 text-xs uppercase tracking-[0.18em]">
+                              {card.detail}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mt-4 grid gap-3 md:grid-cols-3">
+                        {[
+                          {
+                            label: "Dependent txs",
+                            value: formatNumber(dfgDeps.dependentTxs),
+                            detail:
+                              dfgDeps.totalTxs > 0
+                                ? `${formatPercent(
+                                    (dfgDeps.dependentTxs / dfgDeps.totalTxs) * 100,
+                                  )} of DFG txs`
+                                : "—",
+                          },
+                          {
+                            label: "Avg upstream txs",
+                            value: formatDecimal(dfgDeps.avgUpstreamTxs, 2),
+                            detail: "Per dependent tx",
+                          },
+                          {
+                            label: "Avg upstream handles",
+                            value: formatDecimal(dfgDeps.avgUpstreamHandles, 2),
+                            detail: "Per dependent tx",
+                          },
+                        ].map((card) => (
+                          <div
+                            key={card.label}
+                            className="rounded-2xl border border-black/5 bg-white/70 p-4"
+                          >
+                            <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
+                              {card.label}
+                            </p>
+                            <p className="font-code mt-2 text-lg">{card.value}</p>
+                            <p className="muted-text mt-2 text-xs uppercase tracking-[0.18em]">
+                              {card.detail}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                      {(() => {
+                        const activeDistribution =
+                          depthMode === "total"
+                            ? dfgDeps.totalDepthDistribution
+                            : dfgDeps.chainDepthDistribution;
+                        const distributionLabel =
+                          depthMode === "total"
+                            ? "Total depth distribution"
+                            : "Chain depth distribution";
+                        const distributionFooter =
+                          depthMode === "total"
+                            ? "Total depth = tx hops + internal FHE ops (full critical path)"
+                            : "Chain depth = upstream tx hops, not internal FHE ops";
+                        if (!activeDistribution || Object.keys(activeDistribution).length === 0) {
+                          return null;
+                        }
+                        return (
+                          <div className="mt-4 rounded-2xl border border-black/5 bg-white/70 p-4">
+                            <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
+                              {distributionLabel}
+                            </p>
+                            <div className="mt-3 flex">
+                              {(() => {
+                                // Bucket the distribution for readability
+                                const raw = activeDistribution;
+                                const BAR_MAX_HEIGHT = 80; // pixels
+
+                                // Find max depth to determine bucket ranges
+                                const allDepths = Object.keys(raw).map(Number);
+                                const maxDepth = Math.max(...allDepths, 0);
+
+                                // Build buckets dynamically based on max depth
+                                type BucketDef = [number, number, string];
+                                const bucketDefs: BucketDef[] = [];
+
+                                if (maxDepth <= 20) {
+                                  // Small range: show individual values
+                                  for (let i = 0; i <= maxDepth; i++) {
+                                    bucketDefs.push([i, i, String(i)]);
+                                  }
+                                } else if (maxDepth <= 100) {
+                                  // Medium range
+                                  bucketDefs.push([0, 0, "0"]);
+                                  bucketDefs.push([1, 5, "1-5"]);
+                                  bucketDefs.push([6, 10, "6-10"]);
+                                  bucketDefs.push([11, 20, "11-20"]);
+                                  bucketDefs.push([21, 50, "21-50"]);
+                                  bucketDefs.push([51, maxDepth, "51+"]);
+                                } else if (maxDepth <= 1000) {
+                                  // Large range
+                                  bucketDefs.push([0, 0, "0"]);
+                                  bucketDefs.push([1, 10, "1-10"]);
+                                  bucketDefs.push([11, 50, "11-50"]);
+                                  bucketDefs.push([51, 100, "51-100"]);
+                                  if (maxDepth <= 500) {
+                                    bucketDefs.push([101, maxDepth, `101-${maxDepth}`]);
+                                  } else {
+                                    bucketDefs.push([101, 500, "101-500"]);
+                                    bucketDefs.push([501, maxDepth, `501-${maxDepth}`]);
+                                  }
+                                } else {
+                                  // Very large range (1000+)
+                                  bucketDefs.push([0, 0, "0"]);
+                                  bucketDefs.push([1, 10, "1-10"]);
+                                  bucketDefs.push([11, 100, "11-100"]);
+                                  bucketDefs.push([101, 500, "101-500"]);
+                                  if (maxDepth <= 1000) {
+                                    bucketDefs.push([501, maxDepth, `501-${maxDepth}`]);
+                                  } else if (maxDepth <= 2000) {
+                                    bucketDefs.push([501, 1000, "501-1k"]);
+                                    bucketDefs.push([1001, maxDepth, `1k-${maxDepth}`]);
+                                  } else {
+                                    bucketDefs.push([501, 1000, "501-1k"]);
+                                    bucketDefs.push([1001, 2000, "1k-2k"]);
+                                    bucketDefs.push([2001, maxDepth, `2k-${maxDepth}`]);
+                                  }
+                                }
+
+                                const buckets: Array<{
+                                  label: string;
+                                  count: number;
+                                  tooltip: string;
+                                }> = [];
+
+                                for (const [min, max, label] of bucketDefs) {
+                                  let count = 0;
+                                  for (const [k, v] of Object.entries(raw)) {
+                                    const depth = Number(k);
+                                    if (depth >= min && depth <= max) {
+                                      count += v;
+                                    }
+                                  }
+                                  if (count > 0 || min === 0) {
+                                    const tooltip =
+                                      min === max
+                                        ? `Depth ${min}: ${formatNumber(count)} txs`
+                                        : `Depths ${min}-${Math.min(max, maxDepth)}: ${formatNumber(count)} txs`;
+                                    buckets.push({ label, count, tooltip });
+                                  }
+                                }
+
+                                const maxCount = Math.max(...buckets.map((b) => b.count), 1);
+
+                                // Format Y-axis labels (compact numbers)
+                                const formatYLabel = (n: number): string => {
+                                  if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
+                                  if (n >= 1000) return `${(n / 1000).toFixed(0)}k`;
+                                  return String(n);
+                                };
+
+                                return (
+                                  <>
+                                    {/* Y-axis */}
+                                    <div
+                                      className="flex flex-col justify-between pr-2 text-right"
+                                      style={{ height: `${BAR_MAX_HEIGHT + 16}px` }}
+                                    >
+                                      <span className="font-code text-[9px] text-black/40">
+                                        {formatYLabel(maxCount)}
+                                      </span>
+                                      <span className="font-code text-[9px] text-black/40">
+                                        {formatYLabel(Math.round(maxCount / 2))}
+                                      </span>
+                                      <span className="font-code text-[9px] text-black/40">0</span>
+                                    </div>
+                                    {/* Bars */}
+                                    <div className="flex flex-1 items-end gap-2">
+                                      {buckets.map((bucket) => (
+                                        <div
+                                          key={bucket.label}
+                                          className="group relative flex min-w-[36px] flex-1 flex-col items-center"
+                                        >
+                                          {/* Instant tooltip */}
+                                          <div className="pointer-events-none absolute bottom-full left-1/2 z-10 mb-1 -translate-x-1/2 whitespace-nowrap rounded bg-black/80 px-2 py-1 text-[10px] text-white opacity-0 transition-opacity group-hover:opacity-100">
+                                            {bucket.tooltip}
+                                          </div>
+                                          <div
+                                            className="w-full rounded-t bg-black/20 transition-all hover:bg-black/40"
+                                            style={{
+                                              height: `${Math.max((bucket.count / maxCount) * BAR_MAX_HEIGHT, 4)}px`,
+                                            }}
+                                          />
+                                          <span className="font-code mt-1 text-[9px] text-black/50">
+                                            {bucket.label}
+                                          </span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </>
+                                );
+                              })()}
+                            </div>
+                            <p className="muted-text mt-2 text-center text-[10px]">
+                              {distributionFooter}
+                            </p>
+                          </div>
+                        );
+                      })()}
+                      <p className="muted-text mt-3 text-xs">
+                        Chain depth excludes trivial encrypts. Parallelism ratio = independent txs /
+                        total txs.
+                      </p>
+                    </>
+                  ) : (
+                    <p className="muted-text mt-3 text-xs">
+                      Load on demand to avoid blocking the API while computing dependencies.
+                    </p>
+                  )}
                 </>
               ) : (
-                <p className="muted-text mt-3 text-xs">
-                  Load on demand to avoid blocking the API while computing dependencies.
-                </p>
+                /* Rolling chunks view */
+                <>
+                  <div className="flex items-center gap-2 mb-3">
+                    <label htmlFor="chunk-size" className="text-xs text-black/60">
+                      Chunk size:
+                    </label>
+                    <select
+                      id="chunk-size"
+                      value={chunkSize}
+                      onChange={(e) => setChunkSize(Number(e.target.value))}
+                      className="text-xs border border-black/10 rounded px-2 py-1 bg-white"
+                    >
+                      <option value={10}>10 blocks</option>
+                      <option value={50}>50 blocks</option>
+                      <option value={100}>100 blocks</option>
+                      <option value={500}>500 blocks</option>
+                      <option value={1000}>1000 blocks</option>
+                    </select>
+                    <button
+                      type="button"
+                      onClick={loadChunks}
+                      disabled={chunksStatus === "loading"}
+                      className="text-xs px-3 py-1 bg-teal-600 text-white rounded hover:bg-teal-700 disabled:opacity-60"
+                    >
+                      {chunksStatus === "loading" ? "Loading..." : "Load"}
+                    </button>
+                    {chunksStatus === "error" && (
+                      <span className="text-xs text-red-600">
+                        {chunksError ?? "Failed to load."}
+                      </span>
+                    )}
+                  </div>
+
+                  {chunksData.length > 0 ? (
+                    <>
+                      {/* Chunks table */}
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="text-left border-b text-black/60">
+                              <th className="py-2 pr-3">Blocks</th>
+                              <th className="py-2 pr-3 text-right">Txs</th>
+                              <th className="py-2 pr-3 text-right">Parallel %</th>
+                              <th className="py-2 pr-3 text-right">Max depth</th>
+                              <th className="py-2 pr-3 text-right">Avg depth</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {chunksData.map((chunk) => (
+                              <tr key={chunk.startBlock} className="border-b border-black/5">
+                                <td className="py-2 pr-3 font-mono">
+                                  {formatNumber(chunk.startBlock)}–{formatNumber(chunk.endBlock)}
+                                </td>
+                                <td className="py-2 pr-3 text-right">
+                                  {formatNumber(chunk.totalTxs)}
+                                </td>
+                                <td className="py-2 pr-3 text-right">
+                                  {formatPercent(chunk.parallelismRatio * 100)}
+                                </td>
+                                <td className="py-2 pr-3 text-right">{chunk.maxChainDepth}</td>
+                                <td className="py-2 pr-3 text-right">
+                                  {formatDecimal(chunk.avgChainDepth)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+
+                      {/* Parallelism bar chart */}
+                      <div className="mt-4">
+                        <p className="muted-text text-[10px] uppercase tracking-[0.2em] mb-2">
+                          Parallelism over time
+                        </p>
+                        <div className="h-24 flex items-end gap-1">
+                          {chunksData
+                            .slice()
+                            .reverse()
+                            .map((chunk) => (
+                              <div
+                                key={chunk.startBlock}
+                                className="group relative bg-teal-600 flex-1 rounded-t min-w-[4px] hover:bg-teal-500 transition-colors"
+                                style={{ height: `${Math.max(chunk.parallelismRatio * 100, 2)}%` }}
+                              >
+                                <div className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1 z-10 whitespace-nowrap rounded bg-black/80 px-2 py-1 text-[10px] text-white opacity-0 transition-opacity group-hover:opacity-100">
+                                  {formatNumber(chunk.startBlock)}:{" "}
+                                  {formatPercent(chunk.parallelismRatio * 100)}
+                                </div>
+                              </div>
+                            ))}
+                        </div>
+                      </div>
+                    </>
+                  ) : chunksStatus === "ready" ? (
+                    <p className="muted-text text-xs">No chunks data available.</p>
+                  ) : (
+                    <p className="muted-text text-xs">
+                      Click "Load" to fetch rolling chunk statistics.
+                    </p>
+                  )}
+                </>
               )}
             </div>
           ) : null}

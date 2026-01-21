@@ -545,15 +545,16 @@ const insertHandleProducer = db.prepare(
 );
 const insertTxDeps = db.prepare(
   `INSERT INTO dfg_tx_deps (
-     chain_id, tx_hash, block_number, upstream_txs, handle_links, chain_depth
+     chain_id, tx_hash, block_number, upstream_txs, handle_links, chain_depth, total_depth
    ) VALUES (
-     $chainId, $txHash, $blockNumber, $upstreamTxs, $handleLinks, $chainDepth
+     $chainId, $txHash, $blockNumber, $upstreamTxs, $handleLinks, $chainDepth, $totalDepth
    )
    ON CONFLICT(chain_id, tx_hash) DO UPDATE
      SET block_number = excluded.block_number,
          upstream_txs = excluded.upstream_txs,
          handle_links = excluded.handle_links,
          chain_depth = excluded.chain_depth,
+         total_depth = excluded.total_depth,
          updated_at = datetime('now')`,
 );
 const lookupProducer = db.prepare(
@@ -567,6 +568,9 @@ const lookupTxChainDepth = db.prepare(
    FROM dfg_tx_deps
    WHERE chain_id = $chainId AND tx_hash = $txHash
    LIMIT 1`,
+);
+const lookupTxIntraDepth = db.prepare(
+  `SELECT depth FROM dfg_txs WHERE chain_id = $chainId AND tx_hash = $txHash`,
 );
 
 let processed = 0;
@@ -606,19 +610,33 @@ for (const tx of txRows) {
   // Compute chain_depth: max chain_depth of non-trivial upstream txs + 1
   // If no non-trivial upstream deps, chain_depth = 0
   let chainDepth = 0;
+  let maxUpstreamIntraDepth = 0;
   if (nonTrivialUpstreamTxs.size > 0) {
-    let maxUpstreamDepth = 0;
+    let maxUpstreamChainDepth = 0;
     for (const upstreamTxHash of nonTrivialUpstreamTxs) {
       const depthRow = lookupTxChainDepth.get({
         $chainId: tx.chain_id,
         $txHash: upstreamTxHash,
       }) as { chainDepth: number } | undefined;
-      if (depthRow && depthRow.chainDepth > maxUpstreamDepth) {
-        maxUpstreamDepth = depthRow.chainDepth;
+      if (depthRow && depthRow.chainDepth > maxUpstreamChainDepth) {
+        maxUpstreamChainDepth = depthRow.chainDepth;
+      }
+      // Get max intra-tx depth from upstream txs
+      const intraDepthRow = lookupTxIntraDepth.get({
+        $chainId: tx.chain_id,
+        $txHash: upstreamTxHash,
+      }) as { depth: number } | undefined;
+      if (intraDepthRow && intraDepthRow.depth > maxUpstreamIntraDepth) {
+        maxUpstreamIntraDepth = intraDepthRow.depth;
       }
     }
-    chainDepth = maxUpstreamDepth + 1;
+    chainDepth = maxUpstreamChainDepth + 1;
   }
+
+  // Compute total_depth: chain_depth + max upstream intra-tx depth + current tx intra-tx depth
+  // This gives the full critical path including all FHE operations
+  const currentTxIntraDepth = depth; // from buildDfg
+  const totalDepth = chainDepth + maxUpstreamIntraDepth + currentTxIntraDepth;
 
   try {
     db.exec("BEGIN");
@@ -679,6 +697,7 @@ for (const tx of txRows) {
       $upstreamTxs: upstreamTxs.size,
       $handleLinks: handleLinks,
       $chainDepth: chainDepth,
+      $totalDepth: totalDepth,
     });
 
     for (const handle of outputHandles) {

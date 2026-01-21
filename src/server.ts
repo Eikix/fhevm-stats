@@ -26,7 +26,15 @@ type DepStats = {
   maxUpstreamHandles: number;
   parallelismRatio: number;
   maxChainDepth: number;
+  maxTotalDepth: number;
   chainDepthDistribution: Record<number, number>;
+  totalDepthDistribution: Record<number, number>;
+  depthMode?: "inter" | "total";
+  horizon?: {
+    startBlock: number;
+    endBlock: number;
+    blockCount: number;
+  };
 };
 
 const TYPE_COLUMNS: Record<string, string> = {
@@ -348,6 +356,7 @@ function normalizeDepStats(value: unknown): DepStats | null {
   const record = value as Record<string, unknown>;
   const numRecord = record as Record<string, number>;
   const chainDepthDistribution = (record.chainDepthDistribution as Record<number, number>) ?? {};
+  const totalDepthDistribution = (record.totalDepthDistribution as Record<number, number>) ?? {};
   if (
     typeof numRecord.totalTxs === "number" &&
     typeof numRecord.dependentTxs === "number" &&
@@ -370,7 +379,9 @@ function normalizeDepStats(value: unknown): DepStats | null {
       maxUpstreamHandles: numRecord.maxUpstreamHandles ?? 0,
       parallelismRatio,
       maxChainDepth: numRecord.maxChainDepth ?? 0,
+      maxTotalDepth: numRecord.maxTotalDepth ?? 0,
       chainDepthDistribution,
+      totalDepthDistribution,
     };
   }
   if (
@@ -392,7 +403,9 @@ function normalizeDepStats(value: unknown): DepStats | null {
       maxUpstreamHandles: numRecord.maxUpstreamHandles ?? 0,
       parallelismRatio,
       maxChainDepth: numRecord.maxChainDepth ?? 0,
+      maxTotalDepth: numRecord.maxTotalDepth ?? 0,
       chainDepthDistribution,
+      totalDepthDistribution,
     };
   }
   return null;
@@ -660,6 +673,12 @@ function handleDfgSignatures(url: URL): Response {
 function handleDfgStats(url: URL): Response {
   const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
   const includeDeps = url.searchParams.get("includeDeps") === "1";
+  const startBlock = parseNumber(url.searchParams.get("startBlock"));
+  const endBlock = parseNumber(url.searchParams.get("endBlock"));
+  const depthModeParam = url.searchParams.get("depthMode");
+  const depthMode: "inter" | "total" = depthModeParam === "total" ? "total" : "inter";
+  const signatureHash = url.searchParams.get("signatureHash") ?? undefined;
+
   if (chainId === undefined) {
     return jsonResponse({ error: "chain_id_required" }, 400);
   }
@@ -704,8 +723,120 @@ function handleDfgStats(url: URL): Response {
   const coverage = txRow.total > 0 ? dfgRow.total / txRow.total : 0;
 
   let deps: DepStats | null = null;
+  const useBlockRange = startBlock !== undefined && endBlock !== undefined;
 
-  if (hasTable("dfg_dep_rollups")) {
+  // When block range is provided (and optionally signatureHash), query dfg_tx_deps directly
+  if (useBlockRange && hasTable("dfg_tx_deps")) {
+    const depClauses = [
+      "d.chain_id = $chainId",
+      "d.block_number >= $startBlock",
+      "d.block_number <= $endBlock",
+    ];
+    const depParams: Record<string, string | number> = {
+      $chainId: chainId,
+      $startBlock: startBlock,
+      $endBlock: endBlock,
+    };
+    let depFromClause = "FROM dfg_tx_deps d";
+
+    if (signatureHash) {
+      depFromClause =
+        "FROM dfg_tx_deps d JOIN dfg_txs t ON t.chain_id = d.chain_id AND t.tx_hash = d.tx_hash";
+      depClauses.push("t.signature_hash = $signatureHash");
+      depParams.$signatureHash = signatureHash;
+    }
+
+    const depRow = db
+      .prepare(
+        `SELECT
+           COUNT(*) AS totalTxs,
+           SUM(CASE WHEN d.upstream_txs > 0 THEN 1 ELSE 0 END) AS dependentTxs,
+           SUM(CASE WHEN d.upstream_txs > 0 THEN d.upstream_txs ELSE 0 END) AS sumUpstreamTxs,
+           SUM(CASE WHEN d.upstream_txs > 0 THEN d.handle_links ELSE 0 END) AS sumUpstreamHandles,
+           MAX(d.upstream_txs) AS maxUpstreamTxs,
+           MAX(d.handle_links) AS maxUpstreamHandles,
+           MAX(d.chain_depth) AS maxChainDepth,
+           MAX(d.total_depth) AS maxTotalDepth
+         ${depFromClause}
+         WHERE ${depClauses.join(" AND ")}`,
+      )
+      .get(depParams) as {
+      totalTxs: number;
+      dependentTxs: number;
+      sumUpstreamTxs: number;
+      sumUpstreamHandles: number;
+      maxUpstreamTxs: number | null;
+      maxUpstreamHandles: number | null;
+      maxChainDepth: number | null;
+      maxTotalDepth: number | null;
+    };
+
+    // Get chain depth distribution for block range
+    const chainDistRows = db
+      .prepare(
+        `SELECT d.chain_depth AS depth, COUNT(*) AS count
+         ${depFromClause}
+         WHERE ${depClauses.join(" AND ")}
+         GROUP BY d.chain_depth`,
+      )
+      .all(depParams) as Array<{
+      depth: number;
+      count: number;
+    }>;
+
+    // Get total depth distribution for block range
+    const totalDistRows = db
+      .prepare(
+        `SELECT d.total_depth AS depth, COUNT(*) AS count
+         ${depFromClause}
+         WHERE ${depClauses.join(" AND ")}
+         GROUP BY d.total_depth`,
+      )
+      .all(depParams) as Array<{
+      depth: number;
+      count: number;
+    }>;
+
+    const chainDepthDistribution: Record<number, number> = {};
+    for (const row of chainDistRows) {
+      chainDepthDistribution[row.depth] = row.count;
+    }
+
+    const totalDepthDistribution: Record<number, number> = {};
+    for (const row of totalDistRows) {
+      totalDepthDistribution[row.depth] = row.count;
+    }
+
+    const totalTxs = depRow?.totalTxs ?? 0;
+    const dependentTxs = depRow?.dependentTxs ?? 0;
+    const independentTxs = Math.max(totalTxs - dependentTxs, 0);
+    const avgUpstreamTxs = dependentTxs > 0 ? (depRow?.sumUpstreamTxs ?? 0) / dependentTxs : 0;
+    const avgUpstreamHandles =
+      dependentTxs > 0 ? (depRow?.sumUpstreamHandles ?? 0) / dependentTxs : 0;
+    const parallelismRatio = totalTxs > 0 ? independentTxs / totalTxs : 0;
+
+    deps = {
+      totalTxs,
+      dependentTxs,
+      independentTxs,
+      avgUpstreamTxs,
+      avgUpstreamHandles,
+      maxUpstreamTxs: depRow?.maxUpstreamTxs ?? 0,
+      maxUpstreamHandles: depRow?.maxUpstreamHandles ?? 0,
+      parallelismRatio,
+      maxChainDepth: depRow?.maxChainDepth ?? 0,
+      maxTotalDepth: depRow?.maxTotalDepth ?? 0,
+      chainDepthDistribution,
+      totalDepthDistribution,
+      depthMode,
+      horizon: {
+        startBlock,
+        endBlock,
+        blockCount: endBlock - startBlock + 1,
+      },
+    };
+  } else if (!signatureHash && hasTable("dfg_dep_rollups")) {
+    // Use rollup data when no block range specified
     const depsRow = db
       .prepare(
         `SELECT stats_json AS statsJson
@@ -714,30 +845,100 @@ function handleDfgStats(url: URL): Response {
       )
       .get({ $chainId: chainId }) as { statsJson: string } | undefined;
     deps = depsRow ? normalizeDepStats(parseJson(depsRow.statsJson)) : null;
+    if (deps) {
+      deps.depthMode = depthMode;
+    }
   }
 
   if (!deps && includeDeps && hasTable("dfg_tx_deps")) {
+    const depClauses = ["d.chain_id = $chainId"];
+    const depParams: Record<string, string | number> = { $chainId: chainId };
+    let depFromClause = "FROM dfg_tx_deps d";
+
+    if (signatureHash) {
+      depFromClause =
+        "FROM dfg_tx_deps d JOIN dfg_txs t ON t.chain_id = d.chain_id AND t.tx_hash = d.tx_hash";
+      depClauses.push("t.signature_hash = $signatureHash");
+      depParams.$signatureHash = signatureHash;
+    }
+
     const depRow = db
       .prepare(
         `SELECT
            COUNT(*) AS totalTxs,
-           SUM(CASE WHEN upstream_txs > 0 THEN 1 ELSE 0 END) AS dependentTxs,
-           SUM(CASE WHEN upstream_txs > 0 THEN upstream_txs ELSE 0 END) AS sumUpstreamTxs,
-           SUM(CASE WHEN upstream_txs > 0 THEN handle_links ELSE 0 END) AS sumUpstreamHandles,
-           MAX(upstream_txs) AS maxUpstreamTxs,
-           MAX(handle_links) AS maxUpstreamHandles
-         FROM dfg_tx_deps
-         WHERE chain_id = $chainId`,
+           SUM(CASE WHEN d.upstream_txs > 0 THEN 1 ELSE 0 END) AS dependentTxs,
+           SUM(CASE WHEN d.upstream_txs > 0 THEN d.upstream_txs ELSE 0 END) AS sumUpstreamTxs,
+           SUM(CASE WHEN d.upstream_txs > 0 THEN d.handle_links ELSE 0 END) AS sumUpstreamHandles,
+           MAX(d.upstream_txs) AS maxUpstreamTxs,
+           MAX(d.handle_links) AS maxUpstreamHandles,
+           MAX(d.chain_depth) AS maxChainDepth,
+           MAX(d.total_depth) AS maxTotalDepth
+         ${depFromClause}
+         WHERE ${depClauses.join(" AND ")}`,
       )
-      .get({ $chainId: chainId }) as {
+      .get(depParams) as {
       totalTxs: number;
       dependentTxs: number;
       sumUpstreamTxs: number;
       sumUpstreamHandles: number;
       maxUpstreamTxs: number | null;
       maxUpstreamHandles: number | null;
+      maxChainDepth: number | null;
+      maxTotalDepth: number | null;
     };
-    deps = normalizeDepStats(depRow as unknown);
+
+    // Get distributions
+    const chainDistRows = db
+      .prepare(
+        `SELECT d.chain_depth AS depth, COUNT(*) AS count
+         ${depFromClause}
+         WHERE ${depClauses.join(" AND ")}
+         GROUP BY d.chain_depth`,
+      )
+      .all(depParams) as Array<{ depth: number; count: number }>;
+
+    const totalDistRows = db
+      .prepare(
+        `SELECT d.total_depth AS depth, COUNT(*) AS count
+         ${depFromClause}
+         WHERE ${depClauses.join(" AND ")}
+         GROUP BY d.total_depth`,
+      )
+      .all(depParams) as Array<{ depth: number; count: number }>;
+
+    const chainDepthDistribution: Record<number, number> = {};
+    for (const row of chainDistRows) {
+      chainDepthDistribution[row.depth] = row.count;
+    }
+
+    const totalDepthDistribution: Record<number, number> = {};
+    for (const row of totalDistRows) {
+      totalDepthDistribution[row.depth] = row.count;
+    }
+
+    const totalTxs = depRow?.totalTxs ?? 0;
+    const dependentTxs = depRow?.dependentTxs ?? 0;
+    const independentTxs = Math.max(totalTxs - dependentTxs, 0);
+    const avgUpstreamTxs = dependentTxs > 0 ? (depRow?.sumUpstreamTxs ?? 0) / dependentTxs : 0;
+    const avgUpstreamHandles =
+      dependentTxs > 0 ? (depRow?.sumUpstreamHandles ?? 0) / dependentTxs : 0;
+    const parallelismRatio = totalTxs > 0 ? independentTxs / totalTxs : 0;
+
+    deps = {
+      totalTxs,
+      dependentTxs,
+      independentTxs,
+      avgUpstreamTxs,
+      avgUpstreamHandles,
+      maxUpstreamTxs: depRow?.maxUpstreamTxs ?? 0,
+      maxUpstreamHandles: depRow?.maxUpstreamHandles ?? 0,
+      parallelismRatio,
+      maxChainDepth: depRow?.maxChainDepth ?? 0,
+      maxTotalDepth: depRow?.maxTotalDepth ?? 0,
+      chainDepthDistribution,
+      totalDepthDistribution,
+      depthMode,
+    };
   }
 
   if (!deps && includeDeps && hasTable("dfg_nodes") && hasTable("dfg_inputs")) {
@@ -808,9 +1009,21 @@ function handleDfgStats(url: URL): Response {
         maxUpstreamHandles: depRow.maxUpstreamHandles ?? 0,
         parallelismRatio,
         maxChainDepth: 0, // Unavailable in legacy fallback
+        maxTotalDepth: 0, // Unavailable in legacy fallback
         chainDepthDistribution: {}, // Unavailable in legacy fallback
+        totalDepthDistribution: {}, // Unavailable in legacy fallback
+        depthMode,
       };
     }
+  }
+
+  // Get max block with dependency data for horizon filtering
+  let maxDepsBlock: number | null = null;
+  if (hasTable("dfg_tx_deps")) {
+    const maxBlockRow = db
+      .prepare("SELECT MAX(block_number) AS maxBlock FROM dfg_tx_deps WHERE chain_id = $chainId")
+      .get({ $chainId: chainId }) as { maxBlock: number | null } | undefined;
+    maxDepsBlock = maxBlockRow?.maxBlock ?? null;
   }
 
   return jsonResponse({
@@ -819,6 +1032,7 @@ function handleDfgStats(url: URL): Response {
     totalTxs: txRow.total,
     coverage,
     deps,
+    maxDepsBlock,
   });
 }
 
@@ -900,6 +1114,172 @@ function handleDfgExport(url: URL): Response {
   });
 }
 
+function handleDfgStatsChunks(url: URL): Response {
+  const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chunkSize = parseNumber(url.searchParams.get("chunkSize"), 100) ?? 100;
+  const startBlock = parseNumber(url.searchParams.get("startBlock"));
+  const endBlock = parseNumber(url.searchParams.get("endBlock"));
+  const limit = parseNumber(url.searchParams.get("limit"), 50) ?? 50;
+  const signatureHash = url.searchParams.get("signatureHash") ?? undefined;
+
+  if (chainId === undefined) {
+    return jsonResponse({ error: "chain_id_required" }, 400);
+  }
+  if (!hasTable("dfg_tx_deps")) {
+    return jsonResponse({ error: "dfg_tx_deps_missing" }, 404);
+  }
+
+  const clauses = ["d.chain_id = $chainId"];
+  const params: Record<string, string | number> = {
+    $chainId: chainId,
+    $chunkSize: chunkSize,
+    $limit: limit,
+  };
+
+  if (startBlock !== undefined) {
+    clauses.push("d.block_number >= $startBlock");
+    params.$startBlock = startBlock;
+  }
+  if (endBlock !== undefined) {
+    clauses.push("d.block_number <= $endBlock");
+    params.$endBlock = endBlock;
+  }
+
+  let fromClause = "FROM dfg_tx_deps d";
+  if (signatureHash) {
+    fromClause = `FROM dfg_tx_deps d
+    JOIN dfg_txs t ON t.chain_id = d.chain_id AND t.tx_hash = d.tx_hash`;
+    clauses.push("t.signature_hash = $signatureHash");
+    params.$signatureHash = signatureHash;
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT
+        (d.block_number / $chunkSize) * $chunkSize AS chunkStart,
+        COUNT(*) AS totalTxs,
+        SUM(CASE WHEN d.upstream_txs > 0 THEN 1 ELSE 0 END) AS dependentTxs,
+        MAX(d.chain_depth) AS maxChainDepth,
+        MAX(d.total_depth) AS maxTotalDepth,
+        AVG(d.chain_depth) AS avgChainDepth,
+        AVG(d.total_depth) AS avgTotalDepth
+      ${fromClause}
+      WHERE ${clauses.join(" AND ")}
+      GROUP BY chunkStart
+      ORDER BY chunkStart DESC
+      LIMIT $limit`,
+    )
+    .all(params) as Array<{
+    chunkStart: number;
+    totalTxs: number;
+    dependentTxs: number;
+    maxChainDepth: number | null;
+    maxTotalDepth: number | null;
+    avgChainDepth: number | null;
+    avgTotalDepth: number | null;
+  }>;
+
+  const chunks = rows.map((row) => {
+    const totalTxs = row.totalTxs ?? 0;
+    const dependentTxs = row.dependentTxs ?? 0;
+    const independentTxs = Math.max(totalTxs - dependentTxs, 0);
+    const parallelismRatio = totalTxs > 0 ? independentTxs / totalTxs : 0;
+    return {
+      startBlock: row.chunkStart,
+      endBlock: row.chunkStart + chunkSize - 1,
+      totalTxs,
+      dependentTxs,
+      independentTxs,
+      parallelismRatio,
+      maxChainDepth: row.maxChainDepth ?? 0,
+      maxTotalDepth: row.maxTotalDepth ?? 0,
+      avgChainDepth: row.avgChainDepth ?? 0,
+      avgTotalDepth: row.avgTotalDepth ?? 0,
+    };
+  });
+
+  return jsonResponse({
+    chainId,
+    chunkSize,
+    signatureHash,
+    chunks,
+  });
+}
+
+function handleDfgStatsBySignature(url: URL): Response {
+  const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
+  const limit = parseNumber(url.searchParams.get("limit"), 20) ?? 20;
+  const startBlock = parseNumber(url.searchParams.get("startBlock"));
+  const endBlock = parseNumber(url.searchParams.get("endBlock"));
+
+  if (chainId === undefined) {
+    return jsonResponse({ error: "chain_id_required" }, 400);
+  }
+  if (!hasTable("dfg_tx_deps") || !hasTable("dfg_txs")) {
+    return jsonResponse({ error: "dfg_tables_missing" }, 404);
+  }
+
+  const clauses = ["d.chain_id = $chainId", "t.signature_hash IS NOT NULL"];
+  const params: Record<string, string | number> = { $chainId: chainId, $limit: limit };
+
+  if (startBlock !== undefined) {
+    clauses.push("d.block_number >= $startBlock");
+    params.$startBlock = startBlock;
+  }
+  if (endBlock !== undefined) {
+    clauses.push("d.block_number <= $endBlock");
+    params.$endBlock = endBlock;
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT
+        t.signature_hash AS signatureHash,
+        COUNT(*) AS txCount,
+        SUM(CASE WHEN d.upstream_txs > 0 THEN 1 ELSE 0 END) AS dependentTxs,
+        AVG(d.chain_depth) AS avgChainDepth,
+        AVG(d.total_depth) AS avgTotalDepth,
+        MAX(d.chain_depth) AS maxChainDepth,
+        MAX(d.total_depth) AS maxTotalDepth
+      FROM dfg_tx_deps d
+      JOIN dfg_txs t ON t.chain_id = d.chain_id AND t.tx_hash = d.tx_hash
+      WHERE ${clauses.join(" AND ")}
+      GROUP BY t.signature_hash
+      ORDER BY txCount DESC
+      LIMIT $limit`,
+    )
+    .all(params) as Array<{
+    signatureHash: string;
+    txCount: number;
+    dependentTxs: number;
+    avgChainDepth: number | null;
+    avgTotalDepth: number | null;
+    maxChainDepth: number | null;
+    maxTotalDepth: number | null;
+  }>;
+
+  const signatures = rows.map((row) => {
+    const txCount = row.txCount ?? 0;
+    const dependentTxs = row.dependentTxs ?? 0;
+    const parallelismRatio = txCount > 0 ? (txCount - dependentTxs) / txCount : 0;
+    return {
+      signatureHash: row.signatureHash,
+      txCount,
+      dependentTxs,
+      parallelismRatio,
+      avgChainDepth: row.avgChainDepth ?? 0,
+      avgTotalDepth: row.avgTotalDepth ?? 0,
+      maxChainDepth: row.maxChainDepth ?? 0,
+      maxTotalDepth: row.maxTotalDepth ?? 0,
+    };
+  });
+
+  return jsonResponse({
+    chainId,
+    signatures,
+  });
+}
+
 Bun.serve({
   port,
   fetch(req) {
@@ -933,6 +1313,10 @@ Bun.serve({
         return handleDfgRollup(url);
       case "/dfg/export":
         return handleDfgExport(url);
+      case "/dfg/stats/chunks":
+        return handleDfgStatsChunks(url);
+      case "/dfg/stats/by-signature":
+        return handleDfgStatsBySignature(url);
       default:
         return jsonResponse(
           {
@@ -950,6 +1334,8 @@ Bun.serve({
               "/dfg/tx",
               "/dfg/signatures",
               "/dfg/stats",
+              "/dfg/stats/chunks",
+              "/dfg/stats/by-signature",
               "/dfg/rollup",
               "/dfg/export",
             ],
