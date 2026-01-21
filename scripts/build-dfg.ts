@@ -366,10 +366,19 @@ function buildDfg(events: EventRow[]) {
     });
   }
 
+  // Track which output handles are from TrivialEncrypt
+  const trivialHandles = new Set<string>();
+  for (const node of nodes) {
+    if (node.op === "TrivialEncrypt" && node.outputHandle) {
+      trivialHandles.add(node.outputHandle);
+    }
+  }
+
   return {
     nodes,
     edges,
     externalHandles,
+    trivialHandles,
     stats,
     depth: maxDepth,
   };
@@ -389,13 +398,40 @@ const startBlock = parseNumber(Bun.env.START_BLOCK);
 const endBlock = parseNumber(Bun.env.END_BLOCK);
 const txHash = Bun.env.TX_HASH;
 const limit = parseNumber(Bun.env.LIMIT);
+const fullBuild = Bun.env.DFG_BUILD_FULL === "1" || Bun.env.DFG_BUILD_FULL === "true";
 
 const db = initDatabase(dbPath);
 
 const chainId = chainIdEnv;
 
+// Check for checkpoint (incremental build)
+type Checkpoint = { lastBlock: number | null; lastTxHash: string | null };
+const getCheckpoint = db.prepare(
+  `SELECT last_block AS lastBlock, last_tx_hash AS lastTxHash
+   FROM dfg_build_checkpoints WHERE chain_id = $chainId`,
+);
+const upsertCheckpoint = db.prepare(
+  `INSERT INTO dfg_build_checkpoints (chain_id, last_block, last_tx_hash)
+   VALUES ($chainId, $lastBlock, $lastTxHash)
+   ON CONFLICT(chain_id) DO UPDATE
+     SET last_block = excluded.last_block,
+         last_tx_hash = excluded.last_tx_hash,
+         updated_at = datetime('now')`,
+);
+const deleteCheckpoint = db.prepare(`DELETE FROM dfg_build_checkpoints WHERE chain_id = $chainId`);
+
+// Get checkpoint for incremental builds
+let checkpoint: Checkpoint | undefined;
+const useIncremental = !fullBuild && !txHash && chainId !== undefined;
+if (useIncremental && chainId !== undefined) {
+  checkpoint = getCheckpoint.get({ $chainId: chainId }) as Checkpoint | undefined;
+  if (!checkpoint) {
+    console.log(`dfg:build: no checkpoint for chain ${chainId}, will create after first run`);
+  }
+}
+
 const clauses: string[] = [];
-const params: Record<string, string | number> = {};
+const params: Record<string, string | number | null> = {};
 
 if (chainId !== undefined) {
   clauses.push("chain_id = $chainId");
@@ -412,6 +448,15 @@ if (endBlock !== undefined) {
 if (txHash) {
   clauses.push("tx_hash = $txHash");
   params.$txHash = txHash;
+}
+
+// Apply checkpoint filter for incremental builds
+if (useIncremental && checkpoint?.lastBlock !== undefined && checkpoint.lastBlock !== null) {
+  clauses.push(
+    `(block_number > $checkpointBlock OR (block_number = $checkpointBlock AND tx_hash > $checkpointTxHash))`,
+  );
+  params.$checkpointBlock = checkpoint.lastBlock;
+  params.$checkpointTxHash = checkpoint.lastTxHash ?? "";
 }
 
 const whereClause = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
@@ -488,31 +533,39 @@ const insertInput = db.prepare(
 );
 const insertHandleProducer = db.prepare(
   `INSERT INTO dfg_handle_producers (
-     chain_id, handle, tx_hash, block_number
+     chain_id, handle, tx_hash, block_number, is_trivial
    ) VALUES (
-     $chainId, $handle, $txHash, $blockNumber
+     $chainId, $handle, $txHash, $blockNumber, $isTrivial
    )
    ON CONFLICT(chain_id, handle) DO UPDATE
      SET tx_hash = excluded.tx_hash,
          block_number = excluded.block_number,
+         is_trivial = excluded.is_trivial,
          updated_at = datetime('now')`,
 );
 const insertTxDeps = db.prepare(
   `INSERT INTO dfg_tx_deps (
-     chain_id, tx_hash, block_number, upstream_txs, handle_links
+     chain_id, tx_hash, block_number, upstream_txs, handle_links, chain_depth
    ) VALUES (
-     $chainId, $txHash, $blockNumber, $upstreamTxs, $handleLinks
+     $chainId, $txHash, $blockNumber, $upstreamTxs, $handleLinks, $chainDepth
    )
    ON CONFLICT(chain_id, tx_hash) DO UPDATE
      SET block_number = excluded.block_number,
          upstream_txs = excluded.upstream_txs,
          handle_links = excluded.handle_links,
+         chain_depth = excluded.chain_depth,
          updated_at = datetime('now')`,
 );
 const lookupProducer = db.prepare(
-  `SELECT tx_hash AS txHash
+  `SELECT tx_hash AS txHash, is_trivial AS isTrivial
    FROM dfg_handle_producers
    WHERE chain_id = $chainId AND handle = $handle AND block_number <= $blockNumber
+   LIMIT 1`,
+);
+const lookupTxChainDepth = db.prepare(
+  `SELECT chain_depth AS chainDepth
+   FROM dfg_tx_deps
+   WHERE chain_id = $chainId AND tx_hash = $txHash
    LIMIT 1`,
 );
 
@@ -522,7 +575,7 @@ for (const tx of txRows) {
   const events = loadEvents.all({ $chainId: tx.chain_id, $txHash: tx.tx_hash }) as EventRow[];
   if (events.length === 0) continue;
 
-  const { nodes, edges, externalHandles, stats, depth } = buildDfg(events);
+  const { nodes, edges, externalHandles, trivialHandles, stats, depth } = buildDfg(events);
   const nodeCount = nodes.length;
   const edgeCount = edges.length;
   const signatureHash = nodeCount > 0 ? computeSignature(nodes, edges) : null;
@@ -532,17 +585,39 @@ for (const tx of txRows) {
     if (node.outputHandle) outputHandles.add(node.outputHandle);
   }
   const upstreamTxs = new Set<string>();
+  const nonTrivialUpstreamTxs = new Set<string>();
   let handleLinks = 0;
   for (const handle of externalHandles) {
     const producer = lookupProducer.get({
       $chainId: tx.chain_id,
       $handle: handle,
       $blockNumber: tx.block_number,
-    }) as { txHash: string } | undefined;
+    }) as { txHash: string; isTrivial: number } | undefined;
     if (producer && producer.txHash !== tx.tx_hash) {
       upstreamTxs.add(producer.txHash);
       handleLinks += 1;
+      // Track non-trivial upstream txs for chain_depth computation
+      if (producer.isTrivial !== 1) {
+        nonTrivialUpstreamTxs.add(producer.txHash);
+      }
     }
+  }
+
+  // Compute chain_depth: max chain_depth of non-trivial upstream txs + 1
+  // If no non-trivial upstream deps, chain_depth = 0
+  let chainDepth = 0;
+  if (nonTrivialUpstreamTxs.size > 0) {
+    let maxUpstreamDepth = 0;
+    for (const upstreamTxHash of nonTrivialUpstreamTxs) {
+      const depthRow = lookupTxChainDepth.get({
+        $chainId: tx.chain_id,
+        $txHash: upstreamTxHash,
+      }) as { chainDepth: number } | undefined;
+      if (depthRow && depthRow.chainDepth > maxUpstreamDepth) {
+        maxUpstreamDepth = depthRow.chainDepth;
+      }
+    }
+    chainDepth = maxUpstreamDepth + 1;
   }
 
   try {
@@ -603,6 +678,7 @@ for (const tx of txRows) {
       $blockNumber: tx.block_number,
       $upstreamTxs: upstreamTxs.size,
       $handleLinks: handleLinks,
+      $chainDepth: chainDepth,
     });
 
     for (const handle of outputHandles) {
@@ -611,6 +687,7 @@ for (const tx of txRows) {
         $handle: handle,
         $txHash: tx.tx_hash,
         $blockNumber: tx.block_number,
+        $isTrivial: trivialHandles.has(handle) ? 1 : 0,
       });
     }
 
@@ -622,12 +699,36 @@ for (const tx of txRows) {
   }
 }
 
+// Update checkpoint after successful processing
+const lastTx = txRows.length > 0 ? txRows[txRows.length - 1] : undefined;
+if (useIncremental && chainId !== undefined && lastTx) {
+  upsertCheckpoint.run({
+    $chainId: chainId,
+    $lastBlock: lastTx.block_number,
+    $lastTxHash: lastTx.tx_hash,
+  });
+} else if (fullBuild && chainId !== undefined) {
+  // Full build: reset checkpoint to last processed tx
+  if (lastTx) {
+    upsertCheckpoint.run({
+      $chainId: chainId,
+      $lastBlock: lastTx.block_number,
+      $lastTxHash: lastTx.tx_hash,
+    });
+  } else {
+    deleteCheckpoint.run({ $chainId: chainId });
+  }
+}
+
 console.log(
   JSON.stringify(
     {
       generatedAt: new Date().toISOString(),
       dbPath,
       filters: { chainId, startBlock, endBlock, txHash, limit },
+      incremental: useIncremental,
+      fullBuild,
+      checkpoint: checkpoint ?? null,
       txs: txRows.length,
       processed,
     },

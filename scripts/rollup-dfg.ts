@@ -26,6 +26,8 @@ type DepRollupState = {
   sumUpstreamHandles: number;
   maxUpstreamTxs: number;
   maxUpstreamHandles: number;
+  maxChainDepth: number;
+  chainDepthDistribution: Record<number, number>;
 };
 
 function parseNumber(value: string | null | undefined): number | undefined {
@@ -60,6 +62,8 @@ function parseDepRollup(value: string | null): DepRollupState | null {
         sumUpstreamHandles: parsed.sumUpstreamHandles,
         maxUpstreamTxs: parsed.maxUpstreamTxs ?? 0,
         maxUpstreamHandles: parsed.maxUpstreamHandles ?? 0,
+        maxChainDepth: parsed.maxChainDepth ?? 0,
+        chainDepthDistribution: parsed.chainDepthDistribution ?? {},
       };
     }
     if (parsed.dependentTxs !== undefined && parsed.avgUpstreamTxs !== undefined) {
@@ -74,6 +78,8 @@ function parseDepRollup(value: string | null): DepRollupState | null {
         sumUpstreamHandles,
         maxUpstreamTxs: parsed.maxUpstreamTxs ?? 0,
         maxUpstreamHandles: parsed.maxUpstreamHandles ?? 0,
+        maxChainDepth: parsed.maxChainDepth ?? 0,
+        chainDepthDistribution: parsed.chainDepthDistribution ?? {},
       };
     }
   } catch {
@@ -185,12 +191,19 @@ const depFullStmt = db.prepare(
      SUM(CASE WHEN upstream_txs > 0 THEN upstream_txs ELSE 0 END) AS sumUpstreamTxs,
      SUM(CASE WHEN upstream_txs > 0 THEN handle_links ELSE 0 END) AS sumUpstreamHandles,
      MAX(upstream_txs) AS maxUpstreamTxs,
-     MAX(handle_links) AS maxUpstreamHandles
+     MAX(handle_links) AS maxUpstreamHandles,
+     MAX(chain_depth) AS maxChainDepth
    FROM dfg_tx_deps
    WHERE chain_id = $chainId`,
 );
+const chainDepthDistributionStmt = db.prepare(
+  `SELECT chain_depth AS chainDepth, COUNT(*) AS count
+   FROM dfg_tx_deps
+   WHERE chain_id = $chainId
+   GROUP BY chain_depth`,
+);
 const depIncrementalStmt = db.prepare(
-  `SELECT upstream_txs AS upstreamTxs, handle_links AS handleLinks
+  `SELECT upstream_txs AS upstreamTxs, handle_links AS handleLinks, chain_depth AS chainDepth
    FROM dfg_tx_deps
    WHERE chain_id = $chainId
      AND (
@@ -273,6 +286,8 @@ for (const id of chains) {
         sumUpstreamHandles: 0,
         maxUpstreamTxs: 0,
         maxUpstreamHandles: 0,
+        maxChainDepth: 0,
+        chainDepthDistribution: {},
       };
 
       if (effectiveFullRollup || depsForce || !existingDeps) {
@@ -283,6 +298,7 @@ for (const id of chains) {
           sumUpstreamHandles: number;
           maxUpstreamTxs: number | null;
           maxUpstreamHandles: number | null;
+          maxChainDepth: number | null;
         };
         depState.totalTxs = depRow?.totalTxs ?? dfgTxCount;
         depState.dependentTxs = depRow?.dependentTxs ?? 0;
@@ -290,12 +306,23 @@ for (const id of chains) {
         depState.sumUpstreamHandles = depRow?.sumUpstreamHandles ?? 0;
         depState.maxUpstreamTxs = depRow?.maxUpstreamTxs ?? 0;
         depState.maxUpstreamHandles = depRow?.maxUpstreamHandles ?? 0;
+        depState.maxChainDepth = depRow?.maxChainDepth ?? 0;
+
+        // Get chain_depth distribution
+        const distRows = chainDepthDistributionStmt.all({ $chainId: id }) as Array<{
+          chainDepth: number;
+          count: number;
+        }>;
+        depState.chainDepthDistribution = {};
+        for (const distRow of distRows) {
+          depState.chainDepthDistribution[distRow.chainDepth] = distRow.count;
+        }
       } else {
         const newRows = depIncrementalStmt.all({
           $chainId: id,
           $lastBlock: lastBlock,
           $lastTxHash: lastTxHash,
-        }) as Array<{ upstreamTxs: number; handleLinks: number }>;
+        }) as Array<{ upstreamTxs: number; handleLinks: number; chainDepth: number }>;
         depState.totalTxs += newRows.length;
         for (const row of newRows) {
           if (row.upstreamTxs > 0) {
@@ -305,6 +332,10 @@ for (const id of chains) {
           }
           depState.maxUpstreamTxs = Math.max(depState.maxUpstreamTxs, row.upstreamTxs);
           depState.maxUpstreamHandles = Math.max(depState.maxUpstreamHandles, row.handleLinks);
+          depState.maxChainDepth = Math.max(depState.maxChainDepth, row.chainDepth);
+          // Merge into chain_depth distribution
+          depState.chainDepthDistribution[row.chainDepth] =
+            (depState.chainDepthDistribution[row.chainDepth] ?? 0) + 1;
         }
         if (dfgTxCount > depState.totalTxs) {
           depState.totalTxs = dfgTxCount;

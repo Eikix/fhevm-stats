@@ -386,6 +386,7 @@ export function initDatabase(dbPath: string): Database {
       handle TEXT NOT NULL,
       tx_hash TEXT NOT NULL,
       block_number INTEGER NOT NULL,
+      is_trivial INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       PRIMARY KEY (chain_id, handle)
     );
@@ -398,6 +399,7 @@ export function initDatabase(dbPath: string): Database {
       block_number INTEGER NOT NULL,
       upstream_txs INTEGER NOT NULL,
       handle_links INTEGER NOT NULL,
+      chain_depth INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL DEFAULT (datetime('now')),
       PRIMARY KEY (chain_id, tx_hash)
     );
@@ -424,9 +426,17 @@ export function initDatabase(dbPath: string): Database {
       last_tx_hash TEXT,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS dfg_build_checkpoints (
+      chain_id INTEGER PRIMARY KEY,
+      last_block INTEGER,
+      last_tx_hash TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
 
   ensureEventColumns(db);
+  ensureDfgColumns(db);
   return db;
 }
 
@@ -439,6 +449,26 @@ function ensureEventColumns(db: Database): void {
     if (!existing.has(column.name)) {
       db.exec(`ALTER TABLE fhe_events ADD COLUMN ${column.name} ${column.type}`);
     }
+  }
+}
+
+function ensureDfgColumns(db: Database): void {
+  // Add is_trivial column to dfg_handle_producers if missing
+  const producerCols = db.prepare("PRAGMA table_info(dfg_handle_producers)").all() as Array<{
+    name: string;
+  }>;
+  const producerExisting = new Set(producerCols.map((row) => row.name));
+  if (!producerExisting.has("is_trivial")) {
+    db.exec("ALTER TABLE dfg_handle_producers ADD COLUMN is_trivial INTEGER NOT NULL DEFAULT 0");
+  }
+
+  // Add chain_depth column to dfg_tx_deps if missing
+  const depsCols = db.prepare("PRAGMA table_info(dfg_tx_deps)").all() as Array<{
+    name: string;
+  }>;
+  const depsExisting = new Set(depsCols.map((row) => row.name));
+  if (!depsExisting.has("chain_depth")) {
+    db.exec("ALTER TABLE dfg_tx_deps ADD COLUMN chain_depth INTEGER NOT NULL DEFAULT 0");
   }
 }
 

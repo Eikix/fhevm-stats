@@ -24,6 +24,9 @@ type DepStats = {
   avgUpstreamHandles: number;
   maxUpstreamTxs: number;
   maxUpstreamHandles: number;
+  parallelismRatio: number;
+  maxChainDepth: number;
+  chainDepthDistribution: Record<number, number>;
 };
 
 const TYPE_COLUMNS: Record<string, string> = {
@@ -342,40 +345,54 @@ function parseJson(value: string | null): unknown | null {
 
 function normalizeDepStats(value: unknown): DepStats | null {
   if (!value || typeof value !== "object") return null;
-  const record = value as Record<string, number>;
+  const record = value as Record<string, unknown>;
+  const numRecord = record as Record<string, number>;
+  const chainDepthDistribution = (record.chainDepthDistribution as Record<number, number>) ?? {};
   if (
-    typeof record.totalTxs === "number" &&
-    typeof record.dependentTxs === "number" &&
-    typeof record.sumUpstreamTxs === "number" &&
-    typeof record.sumUpstreamHandles === "number"
+    typeof numRecord.totalTxs === "number" &&
+    typeof numRecord.dependentTxs === "number" &&
+    typeof numRecord.sumUpstreamTxs === "number" &&
+    typeof numRecord.sumUpstreamHandles === "number"
   ) {
-    const dependentTxs = record.dependentTxs;
-    const avgUpstreamTxs = dependentTxs > 0 ? record.sumUpstreamTxs / dependentTxs : 0;
-    const avgUpstreamHandles = dependentTxs > 0 ? record.sumUpstreamHandles / dependentTxs : 0;
+    const dependentTxs = numRecord.dependentTxs;
+    const totalTxs = numRecord.totalTxs;
+    const independentTxs = Math.max(totalTxs - dependentTxs, 0);
+    const avgUpstreamTxs = dependentTxs > 0 ? numRecord.sumUpstreamTxs / dependentTxs : 0;
+    const avgUpstreamHandles = dependentTxs > 0 ? numRecord.sumUpstreamHandles / dependentTxs : 0;
+    const parallelismRatio = totalTxs > 0 ? independentTxs / totalTxs : 0;
     return {
-      totalTxs: record.totalTxs,
+      totalTxs,
       dependentTxs,
-      independentTxs: Math.max(record.totalTxs - dependentTxs, 0),
+      independentTxs,
       avgUpstreamTxs,
       avgUpstreamHandles,
-      maxUpstreamTxs: record.maxUpstreamTxs ?? 0,
-      maxUpstreamHandles: record.maxUpstreamHandles ?? 0,
+      maxUpstreamTxs: numRecord.maxUpstreamTxs ?? 0,
+      maxUpstreamHandles: numRecord.maxUpstreamHandles ?? 0,
+      parallelismRatio,
+      maxChainDepth: numRecord.maxChainDepth ?? 0,
+      chainDepthDistribution,
     };
   }
   if (
-    typeof record.totalTxs === "number" &&
-    typeof record.dependentTxs === "number" &&
-    typeof record.avgUpstreamTxs === "number" &&
-    typeof record.avgUpstreamHandles === "number"
+    typeof numRecord.totalTxs === "number" &&
+    typeof numRecord.dependentTxs === "number" &&
+    typeof numRecord.avgUpstreamTxs === "number" &&
+    typeof numRecord.avgUpstreamHandles === "number"
   ) {
+    const totalTxs = numRecord.totalTxs;
+    const independentTxs = Math.max(totalTxs - numRecord.dependentTxs, 0);
+    const parallelismRatio = totalTxs > 0 ? independentTxs / totalTxs : 0;
     return {
-      totalTxs: record.totalTxs,
-      dependentTxs: record.dependentTxs,
-      independentTxs: Math.max(record.totalTxs - record.dependentTxs, 0),
-      avgUpstreamTxs: record.avgUpstreamTxs,
-      avgUpstreamHandles: record.avgUpstreamHandles,
-      maxUpstreamTxs: record.maxUpstreamTxs ?? 0,
-      maxUpstreamHandles: record.maxUpstreamHandles ?? 0,
+      totalTxs,
+      dependentTxs: numRecord.dependentTxs,
+      independentTxs,
+      avgUpstreamTxs: numRecord.avgUpstreamTxs,
+      avgUpstreamHandles: numRecord.avgUpstreamHandles,
+      maxUpstreamTxs: numRecord.maxUpstreamTxs ?? 0,
+      maxUpstreamHandles: numRecord.maxUpstreamHandles ?? 0,
+      parallelismRatio,
+      maxChainDepth: numRecord.maxChainDepth ?? 0,
+      chainDepthDistribution,
     };
   }
   return null;
@@ -779,14 +796,19 @@ function handleDfgStats(url: URL): Response {
     if (depRow) {
       const totalTxs = depRow.totalTxs ?? 0;
       const dependentTxs = depRow.dependentTxs ?? 0;
+      const independentTxs = Math.max(totalTxs - dependentTxs, 0);
+      const parallelismRatio = totalTxs > 0 ? independentTxs / totalTxs : 0;
       deps = {
         totalTxs,
         dependentTxs,
-        independentTxs: Math.max(totalTxs - dependentTxs, 0),
+        independentTxs,
         avgUpstreamTxs: depRow.avgUpstreamTxs ?? 0,
         avgUpstreamHandles: depRow.avgUpstreamHandles ?? 0,
         maxUpstreamTxs: depRow.maxUpstreamTxs ?? 0,
         maxUpstreamHandles: depRow.maxUpstreamHandles ?? 0,
+        parallelismRatio,
+        maxChainDepth: 0, // Unavailable in legacy fallback
+        chainDepthDistribution: {}, // Unavailable in legacy fallback
       };
     }
   }
@@ -833,6 +855,51 @@ function handleDfgRollup(url: URL): Response {
   });
 }
 
+function handleDfgExport(url: URL): Response {
+  const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
+  if (chainId === undefined) {
+    return jsonResponse({ error: "chain_id_required" }, 400);
+  }
+  if (!hasTable("dfg_dep_rollups")) {
+    return jsonResponse({ error: "dfg_dep_rollups_missing" }, 404);
+  }
+
+  const depsRow = db
+    .prepare(
+      `SELECT stats_json AS statsJson
+       FROM dfg_dep_rollups
+       WHERE chain_id = $chainId`,
+    )
+    .get({ $chainId: chainId }) as { statsJson: string } | undefined;
+
+  if (!depsRow) {
+    return jsonResponse({ error: "no_dep_rollup_for_chain" }, 404);
+  }
+
+  const deps = normalizeDepStats(parseJson(depsRow.statsJson));
+  if (!deps) {
+    return jsonResponse({ error: "invalid_dep_rollup_data" }, 500);
+  }
+
+  return jsonResponse({
+    chainId,
+    summary: {
+      totalTxs: deps.totalTxs,
+      dependentTxs: deps.dependentTxs,
+      independentTxs: deps.independentTxs,
+      parallelismRatio: deps.parallelismRatio,
+      maxChainDepth: deps.maxChainDepth,
+      avgUpstreamTxs: deps.avgUpstreamTxs,
+      avgUpstreamHandles: deps.avgUpstreamHandles,
+      maxUpstreamTxs: deps.maxUpstreamTxs,
+      maxUpstreamHandles: deps.maxUpstreamHandles,
+    },
+    distribution: {
+      chainDepths: deps.chainDepthDistribution,
+    },
+  });
+}
+
 Bun.serve({
   port,
   fetch(req) {
@@ -864,6 +931,8 @@ Bun.serve({
         return handleDfgStats(url);
       case "/dfg/rollup":
         return handleDfgRollup(url);
+      case "/dfg/export":
+        return handleDfgExport(url);
       default:
         return jsonResponse(
           {
@@ -882,6 +951,7 @@ Bun.serve({
               "/dfg/signatures",
               "/dfg/stats",
               "/dfg/rollup",
+              "/dfg/export",
             ],
           },
           404,

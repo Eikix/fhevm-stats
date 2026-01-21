@@ -93,6 +93,9 @@ type DfgStatsResponse = {
     avgUpstreamHandles: number;
     maxUpstreamTxs: number;
     maxUpstreamHandles: number;
+    parallelismRatio: number;
+    maxChainDepth: number;
+    chainDepthDistribution: Record<number, number>;
   } | null;
 };
 
@@ -1465,32 +1468,22 @@ function App() {
               </div>
               {dfgDeps ? (
                 <>
-                  <div className="mt-4 grid gap-3 md:grid-cols-4">
+                  <div className="mt-4 grid gap-3 md:grid-cols-3">
                     {[
                       {
-                        label: "Dependent txs",
-                        value: formatNumber(dfgDeps.dependentTxs),
-                        detail:
-                          dfgDeps.totalTxs > 0
-                            ? `${formatPercent(
-                                (dfgDeps.dependentTxs / dfgDeps.totalTxs) * 100,
-                              )} of DFG txs`
-                            : "—",
+                        label: "Parallelism",
+                        value: formatPercent(dfgDeps.parallelismRatio * 100),
+                        detail: "Independent / total txs",
+                      },
+                      {
+                        label: "Max chain depth",
+                        value: formatNumber(dfgDeps.maxChainDepth),
+                        detail: "Longest dependency path",
                       },
                       {
                         label: "Independent txs",
                         value: formatNumber(dfgDeps.independentTxs),
-                        detail: "No upstream handles",
-                      },
-                      {
-                        label: "Avg upstream txs",
-                        value: formatDecimal(dfgDeps.avgUpstreamTxs, 2),
-                        detail: "Per dependent tx",
-                      },
-                      {
-                        label: "Avg upstream handles",
-                        value: formatDecimal(dfgDeps.avgUpstreamHandles, 2),
-                        detail: "Per dependent tx",
+                        detail: "Chain depth = 0",
                       },
                     ].map((card) => (
                       <div
@@ -1507,9 +1500,88 @@ function App() {
                       </div>
                     ))}
                   </div>
+                  <div className="mt-4 grid gap-3 md:grid-cols-4">
+                    {[
+                      {
+                        label: "Dependent txs",
+                        value: formatNumber(dfgDeps.dependentTxs),
+                        detail:
+                          dfgDeps.totalTxs > 0
+                            ? `${formatPercent(
+                                (dfgDeps.dependentTxs / dfgDeps.totalTxs) * 100,
+                              )} of DFG txs`
+                            : "—",
+                      },
+                      {
+                        label: "Avg upstream txs",
+                        value: formatDecimal(dfgDeps.avgUpstreamTxs, 2),
+                        detail: "Per dependent tx",
+                      },
+                      {
+                        label: "Avg upstream handles",
+                        value: formatDecimal(dfgDeps.avgUpstreamHandles, 2),
+                        detail: "Per dependent tx",
+                      },
+                      {
+                        label: "Total txs",
+                        value: formatNumber(dfgDeps.totalTxs),
+                        detail: "With dependency data",
+                      },
+                    ].map((card) => (
+                      <div
+                        key={card.label}
+                        className="rounded-2xl border border-black/5 bg-white/70 p-4"
+                      >
+                        <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
+                          {card.label}
+                        </p>
+                        <p className="font-code mt-2 text-lg">{card.value}</p>
+                        <p className="muted-text mt-2 text-xs uppercase tracking-[0.18em]">
+                          {card.detail}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                  {dfgDeps.chainDepthDistribution &&
+                    Object.keys(dfgDeps.chainDepthDistribution).length > 0 && (
+                      <div className="mt-4 rounded-2xl border border-black/5 bg-white/70 p-4">
+                        <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
+                          Chain depth distribution
+                        </p>
+                        <div className="mt-3 flex items-end gap-1" style={{ height: "80px" }}>
+                          {(() => {
+                            const entries = Object.entries(dfgDeps.chainDepthDistribution)
+                              .map(([k, v]) => ({ depth: Number(k), count: v }))
+                              .sort((a, b) => a.depth - b.depth);
+                            const maxCount = Math.max(...entries.map((e) => e.count), 1);
+                            return entries.map((entry) => (
+                              <div
+                                key={entry.depth}
+                                className="flex flex-1 flex-col items-center"
+                                title={`Depth ${entry.depth}: ${formatNumber(entry.count)} txs`}
+                              >
+                                <div
+                                  className="w-full rounded-t bg-black/20"
+                                  style={{
+                                    height: `${Math.max((entry.count / maxCount) * 100, 4)}%`,
+                                    minHeight: "4px",
+                                  }}
+                                />
+                                <span className="font-code mt-1 text-[10px] text-black/50">
+                                  {entry.depth}
+                                </span>
+                              </div>
+                            ));
+                          })()}
+                        </div>
+                        <p className="muted-text mt-2 text-center text-[10px]">
+                          Chain depth (0 = parallel, higher = more sequential)
+                        </p>
+                      </div>
+                    )}
                   <p className="muted-text mt-3 text-xs">
-                    Dependency means a tx consumes a handle produced in an earlier tx on the same
-                    chain.
+                    Chain depth excludes trivial encrypts. Parallelism ratio = independent txs /
+                    total txs.
                   </p>
                 </>
               ) : (
