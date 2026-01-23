@@ -509,6 +509,8 @@ function handleDfgTx(url: URL): Response {
     return jsonResponse({ error: "tx_hash_required" }, 400);
   }
 
+  const lookbackBlocks = parseNumber(url.searchParams.get("lookbackBlocks"));
+
   const txRow = db
     .prepare(
       `SELECT tx_hash AS txHash,
@@ -582,6 +584,40 @@ function handleDfgTx(url: URL): Response {
     )
     .all({ $chainId: chainId, $txHash: txHash }) as Array<{ handle: string; kind: string }>;
 
+  // Compute cut edges if lookbackBlocks is specified
+  let cutEdges: Array<{
+    handle: string;
+    producerTxHash: string;
+    producerBlock: number;
+    windowStart: number;
+  }> = [];
+
+  if (lookbackBlocks !== undefined && hasTable("dfg_handle_producers")) {
+    const windowStart = txRow.blockNumber - lookbackBlocks + 1;
+    const externalInputs = inputs.filter((input) => input.kind === "external");
+
+    for (const input of externalInputs) {
+      const producerRow = db
+        .prepare(
+          `SELECT tx_hash AS producerTxHash, block_number AS producerBlock
+           FROM dfg_handle_producers
+           WHERE chain_id = $chainId AND handle = $handle`,
+        )
+        .get({ $chainId: chainId, $handle: input.handle }) as
+        | { producerTxHash: string; producerBlock: number }
+        | undefined;
+
+      if (producerRow && producerRow.producerBlock < windowStart) {
+        cutEdges.push({
+          handle: input.handle,
+          producerTxHash: producerRow.producerTxHash,
+          producerBlock: producerRow.producerBlock,
+          windowStart,
+        });
+      }
+    }
+  }
+
   return jsonResponse({
     tx: {
       txHash: txRow.txHash,
@@ -602,6 +638,7 @@ function handleDfgTx(url: URL): Response {
     })),
     edges,
     inputs,
+    ...(lookbackBlocks !== undefined ? { cutEdges, lookbackBlocks } : {}),
   });
 }
 
@@ -1114,12 +1151,9 @@ function handleDfgExport(url: URL): Response {
   });
 }
 
-function handleDfgStatsChunks(url: URL): Response {
+function handleDfgStatsHorizon(url: URL): Response {
   const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
-  const chunkSize = parseNumber(url.searchParams.get("chunkSize"), 100) ?? 100;
-  const startBlock = parseNumber(url.searchParams.get("startBlock"));
-  const endBlock = parseNumber(url.searchParams.get("endBlock"));
-  const limit = parseNumber(url.searchParams.get("limit"), 50) ?? 50;
+  const horizonSize = parseNumber(url.searchParams.get("horizonSize"), 10) ?? 10;
   const signatureHash = url.searchParams.get("signatureHash") ?? undefined;
 
   if (chainId === undefined) {
@@ -1132,18 +1166,8 @@ function handleDfgStatsChunks(url: URL): Response {
   const clauses = ["d.chain_id = $chainId"];
   const params: Record<string, string | number> = {
     $chainId: chainId,
-    $chunkSize: chunkSize,
-    $limit: limit,
+    $horizonSize: horizonSize,
   };
-
-  if (startBlock !== undefined) {
-    clauses.push("d.block_number >= $startBlock");
-    params.$startBlock = startBlock;
-  }
-  if (endBlock !== undefined) {
-    clauses.push("d.block_number <= $endBlock");
-    params.$endBlock = endBlock;
-  }
 
   let fromClause = "FROM dfg_tx_deps d";
   if (signatureHash) {
@@ -1153,56 +1177,435 @@ function handleDfgStatsChunks(url: URL): Response {
     params.$signatureHash = signatureHash;
   }
 
-  const rows = db
+  // Aggregate across all non-overlapping N-block windows
+  const row = db
+    .prepare(
+      `WITH chunks AS (
+        SELECT
+          (d.block_number / $horizonSize) AS chunk_id,
+          MAX(d.chain_depth) AS max_chain_depth,
+          MAX(d.total_depth) AS max_total_depth,
+          COUNT(*) AS total_txs,
+          SUM(CASE WHEN d.upstream_txs = 0 THEN 1 ELSE 0 END) AS independent_txs
+        ${fromClause}
+        WHERE ${clauses.join(" AND ")}
+        GROUP BY chunk_id
+      )
+      SELECT
+        COUNT(*) AS sample_count,
+        AVG(max_chain_depth) AS avg_max_chain_depth,
+        AVG(max_total_depth) AS avg_max_total_depth,
+        MAX(max_chain_depth) AS max_max_chain_depth,
+        MAX(max_total_depth) AS max_max_total_depth,
+        AVG(CAST(independent_txs AS REAL) / total_txs) AS avg_parallelism,
+        MIN(CAST(independent_txs AS REAL) / total_txs) AS min_parallelism
+      FROM chunks
+      WHERE total_txs > 0`,
+    )
+    .get(params) as {
+    sample_count: number;
+    avg_max_chain_depth: number | null;
+    avg_max_total_depth: number | null;
+    max_max_chain_depth: number | null;
+    max_max_total_depth: number | null;
+    avg_parallelism: number | null;
+    min_parallelism: number | null;
+  } | undefined;
+
+  return jsonResponse({
+    chainId,
+    signatureHash,
+    horizon: {
+      blockSize: horizonSize,
+      sampleCount: row?.sample_count ?? 0,
+      summary: {
+        avgMaxChainDepth: row?.avg_max_chain_depth ?? 0,
+        avgMaxTotalDepth: row?.avg_max_total_depth ?? 0,
+        maxMaxChainDepth: row?.max_max_chain_depth ?? 0,
+        maxMaxTotalDepth: row?.max_max_total_depth ?? 0,
+        avgParallelismRatio: row?.avg_parallelism ?? 0,
+        minParallelismRatio: row?.min_parallelism ?? 0,
+      },
+    },
+  });
+}
+
+function handleDfgPattern(url: URL): Response {
+  const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
+  const signatureHash = url.searchParams.get("signatureHash");
+  const exampleLimit = parseNumber(url.searchParams.get("exampleLimit"), 5) ?? 5;
+
+  if (chainId === undefined) {
+    return jsonResponse({ error: "chain_id_required" }, 400);
+  }
+  if (!signatureHash) {
+    return jsonResponse({ error: "signature_hash_required" }, 400);
+  }
+  if (!hasTable("dfg_tx_deps") || !hasTable("dfg_txs")) {
+    return jsonResponse({ error: "dfg_tables_missing" }, 404);
+  }
+
+  // Get stats for this specific pattern
+  const statsRow = db
     .prepare(
       `SELECT
-        (d.block_number / $chunkSize) * $chunkSize AS chunkStart,
-        COUNT(*) AS totalTxs,
+        COUNT(*) AS txCount,
         SUM(CASE WHEN d.upstream_txs > 0 THEN 1 ELSE 0 END) AS dependentTxs,
+        AVG(d.chain_depth) AS avgChainDepth,
+        AVG(d.total_depth) AS avgTotalDepth,
         MAX(d.chain_depth) AS maxChainDepth,
         MAX(d.total_depth) AS maxTotalDepth,
-        AVG(d.chain_depth) AS avgChainDepth,
-        AVG(d.total_depth) AS avgTotalDepth
-      ${fromClause}
-      WHERE ${clauses.join(" AND ")}
-      GROUP BY chunkStart
-      ORDER BY chunkStart DESC
-      LIMIT $limit`,
+        AVG(d.upstream_txs) AS avgUpstreamTxs,
+        MAX(d.upstream_txs) AS maxUpstreamTxs
+      FROM dfg_tx_deps d
+      JOIN dfg_txs t ON t.chain_id = d.chain_id AND t.tx_hash = d.tx_hash
+      WHERE d.chain_id = $chainId AND t.signature_hash = $signatureHash`,
     )
-    .all(params) as Array<{
-    chunkStart: number;
-    totalTxs: number;
+    .get({ $chainId: chainId, $signatureHash: signatureHash }) as {
+    txCount: number;
     dependentTxs: number;
-    maxChainDepth: number | null;
-    maxTotalDepth: number | null;
     avgChainDepth: number | null;
     avgTotalDepth: number | null;
+    maxChainDepth: number | null;
+    maxTotalDepth: number | null;
+    avgUpstreamTxs: number | null;
+    maxUpstreamTxs: number | null;
+  } | undefined;
+
+  if (!statsRow || statsRow.txCount === 0) {
+    return jsonResponse({ error: "pattern_not_found" }, 404);
+  }
+
+  // Get example transactions (prioritize higher depth ones)
+  const exampleRows = db
+    .prepare(
+      `SELECT d.tx_hash AS txHash, d.block_number AS blockNumber, d.chain_depth AS chainDepth, d.total_depth AS totalDepth
+       FROM dfg_tx_deps d
+       JOIN dfg_txs t ON t.chain_id = d.chain_id AND t.tx_hash = d.tx_hash
+       WHERE d.chain_id = $chainId AND t.signature_hash = $signatureHash
+       ORDER BY d.chain_depth DESC, d.block_number DESC
+       LIMIT $limit`,
+    )
+    .all({ $chainId: chainId, $signatureHash: signatureHash, $limit: exampleLimit }) as Array<{
+    txHash: string;
+    blockNumber: number;
+    chainDepth: number;
+    totalDepth: number;
   }>;
 
-  const chunks = rows.map((row) => {
-    const totalTxs = row.totalTxs ?? 0;
-    const dependentTxs = row.dependentTxs ?? 0;
-    const independentTxs = Math.max(totalTxs - dependentTxs, 0);
-    const parallelismRatio = totalTxs > 0 ? independentTxs / totalTxs : 0;
-    return {
-      startBlock: row.chunkStart,
-      endBlock: row.chunkStart + chunkSize - 1,
+  const txCount = statsRow.txCount ?? 0;
+  const dependentTxs = statsRow.dependentTxs ?? 0;
+  const parallelismRatio = txCount > 0 ? (txCount - dependentTxs) / txCount : 0;
+
+  return jsonResponse({
+    signatureHash,
+    stats: {
+      txCount,
+      dependentTxs,
+      parallelismRatio,
+      avgChainDepth: statsRow.avgChainDepth ?? 0,
+      avgTotalDepth: statsRow.avgTotalDepth ?? 0,
+      maxChainDepth: statsRow.maxChainDepth ?? 0,
+      maxTotalDepth: statsRow.maxTotalDepth ?? 0,
+      avgUpstreamTxs: statsRow.avgUpstreamTxs ?? 0,
+      maxUpstreamTxs: statsRow.maxUpstreamTxs ?? 0,
+    },
+    exampleTxs: exampleRows,
+  });
+}
+
+function handleDfgStatsWindow(url: URL): Response {
+  const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
+  const lookbackBlocks = parseNumber(url.searchParams.get("lookbackBlocks"), 50) ?? 50;
+  const signatureHash = url.searchParams.get("signatureHash") ?? undefined;
+  const topLimit = parseNumber(url.searchParams.get("topLimit"), 10) ?? 10;
+
+  if (chainId === undefined) {
+    return jsonResponse({ error: "chain_id_required" }, 400);
+  }
+  if (!hasTable("dfg_inputs") || !hasTable("dfg_handle_producers") || !hasTable("dfg_txs")) {
+    return jsonResponse({ error: "dfg_tables_missing" }, 404);
+  }
+
+  // Get all transactions with their blocks and intra-tx depth
+  const txClauses = ["t.chain_id = $chainId"];
+  const txParams: Record<string, string | number> = { $chainId: chainId };
+  let txQuery = `
+    SELECT t.tx_hash AS txHash, t.block_number AS blockNumber,
+           t.depth AS intraTxDepth, d.chain_depth AS fullChainDepth
+    FROM dfg_txs t
+    LEFT JOIN dfg_tx_deps d ON d.chain_id = t.chain_id AND d.tx_hash = t.tx_hash
+    WHERE ${txClauses.join(" AND ")}
+  `;
+
+  if (signatureHash) {
+    txQuery = `
+      SELECT t.tx_hash AS txHash, t.block_number AS blockNumber,
+             t.depth AS intraTxDepth, d.chain_depth AS fullChainDepth
+      FROM dfg_txs t
+      LEFT JOIN dfg_tx_deps d ON d.chain_id = t.chain_id AND d.tx_hash = t.tx_hash
+      WHERE t.chain_id = $chainId AND t.signature_hash = $signatureHash
+    `;
+    txParams.$signatureHash = signatureHash;
+  }
+
+  const txRows = db.prepare(txQuery).all(txParams) as Array<{
+    txHash: string;
+    blockNumber: number;
+    intraTxDepth: number | null;
+    fullChainDepth: number | null;
+  }>;
+
+  if (txRows.length === 0) {
+    return jsonResponse({
+      chainId,
+      lookbackBlocks,
+      signatureHash,
+      stats: {
+        totalTxs: 0,
+        dependentTxs: 0,
+        independentTxs: 0,
+        parallelismRatio: 1,
+        maxTruncatedDepth: 0,
+        avgTruncatedDepth: 0,
+        truncatedDepthDistribution: {},
+      },
+      topDepthTxs: [],
+    });
+  }
+
+  // Build tx block lookup
+  const txBlockMap = new Map<string, number>();
+  for (const row of txRows) {
+    txBlockMap.set(row.txHash, row.blockNumber);
+  }
+
+  // Get external inputs for all txs
+  const inputRows = db
+    .prepare(
+      `SELECT i.tx_hash AS consumerTxHash, i.handle
+       FROM dfg_inputs i
+       WHERE i.chain_id = $chainId AND i.kind = 'external'`,
+    )
+    .all({ $chainId: chainId }) as Array<{ consumerTxHash: string; handle: string }>;
+
+  // Get handle producers (non-trivial only for dependency calculation)
+  const producerRows = db
+    .prepare(
+      `SELECT handle, tx_hash AS producerTxHash, block_number AS producerBlock
+       FROM dfg_handle_producers
+       WHERE chain_id = $chainId AND is_trivial = 0`,
+    )
+    .all({ $chainId: chainId }) as Array<{
+    handle: string;
+    producerTxHash: string;
+    producerBlock: number;
+  }>;
+
+  // Build handle -> producer lookup
+  const handleProducers = new Map<string, { txHash: string; block: number }>();
+  for (const row of producerRows) {
+    handleProducers.set(row.handle, { txHash: row.producerTxHash, block: row.producerBlock });
+  }
+
+  // Build consumer tx -> list of producer txs (with their blocks) within window
+  const txUpstreams = new Map<string, Array<{ txHash: string; block: number }>>();
+  for (const row of inputRows) {
+    const consumerBlock = txBlockMap.get(row.consumerTxHash);
+    if (consumerBlock === undefined) continue;
+
+    const producer = handleProducers.get(row.handle);
+    if (!producer) continue;
+    if (producer.txHash === row.consumerTxHash) continue; // self-reference
+
+    // Check window: producer must be within lookback window and not from future
+    const windowStart = consumerBlock - lookbackBlocks + 1;
+    if (producer.block < windowStart || producer.block > consumerBlock) continue; // truncated!
+
+    let upstreams = txUpstreams.get(row.consumerTxHash);
+    if (!upstreams) {
+      upstreams = [];
+      txUpstreams.set(row.consumerTxHash, upstreams);
+    }
+    // Add if not already present
+    if (!upstreams.some((u) => u.txHash === producer.txHash)) {
+      upstreams.push({ txHash: producer.txHash, block: producer.block });
+    }
+  }
+
+  // Build lookups for depth computation
+  const intraTxDepths = new Map<string, number>();
+  const txBlockLookup = new Map<string, number>();
+  for (const tx of txRows) {
+    intraTxDepths.set(tx.txHash, tx.intraTxDepth ?? 0);
+    txBlockLookup.set(tx.txHash, tx.blockNumber);
+  }
+
+  // Build full dependency graph (without window filtering) for chain traversal
+  const fullUpstreams = new Map<string, string[]>();
+  for (const row of inputRows) {
+    const producer = handleProducers.get(row.handle);
+    if (!producer) continue;
+    if (producer.txHash === row.consumerTxHash) continue;
+
+    let upstreams = fullUpstreams.get(row.consumerTxHash);
+    if (!upstreams) {
+      upstreams = [];
+      fullUpstreams.set(row.consumerTxHash, upstreams);
+    }
+    if (!upstreams.includes(producer.txHash)) {
+      upstreams.push(producer.txHash);
+    }
+  }
+
+  // Compute depths PER TX with proper window truncation
+  // For each tx, traverse its dependency chain and stop when hitting txs outside its window
+  const interTxDepths = new Map<string, number>();
+  const combinedDepths = new Map<string, number>();
+
+  for (const tx of txRows) {
+    const windowStart = tx.blockNumber - lookbackBlocks + 1;
+    const windowEnd = tx.blockNumber; // dependencies can only be from past/same block
+    const visited = new Set<string>();
+
+    // Recursive function to compute combined depth within this tx's window
+    const computeDepth = (txHash: string): { inter: number; combined: number } => {
+      if (visited.has(txHash)) {
+        return { inter: 0, combined: 0 }; // cycle protection
+      }
+      visited.add(txHash);
+
+      const block = txBlockLookup.get(txHash);
+      if (block === undefined || block < windowStart || block > windowEnd) {
+        // Outside window - truncate here (contributes 0)
+        return { inter: 0, combined: 0 };
+      }
+
+      const myIntra = intraTxDepths.get(txHash) ?? 0;
+      const upstreams = fullUpstreams.get(txHash) ?? [];
+
+      if (upstreams.length === 0) {
+        return { inter: 0, combined: myIntra };
+      }
+
+      let maxUpstreamInter = 0;
+      let maxUpstreamCombined = 0;
+      for (const upstream of upstreams) {
+        const upstreamBlock = txBlockLookup.get(upstream);
+        if (upstreamBlock === undefined || upstreamBlock < windowStart || upstreamBlock > windowEnd) {
+          continue; // truncated (outside window or future block)
+        }
+        const { inter, combined } = computeDepth(upstream);
+        maxUpstreamInter = Math.max(maxUpstreamInter, inter);
+        maxUpstreamCombined = Math.max(maxUpstreamCombined, combined);
+      }
+
+      const hasInWindowUpstreams = upstreams.some((u) => {
+        const b = txBlockLookup.get(u);
+        return b !== undefined && b >= windowStart && b <= windowEnd;
+      });
+
+      return {
+        inter: hasInWindowUpstreams ? maxUpstreamInter + 1 : 0,
+        combined: maxUpstreamCombined + myIntra,
+      };
+    };
+
+    const { inter, combined } = computeDepth(tx.txHash);
+    interTxDepths.set(tx.txHash, inter);
+    combinedDepths.set(tx.txHash, combined);
+  }
+
+  // Aggregate stats
+  let totalTxs = 0;
+  let dependentTxs = 0;
+  let sumInterDepth = 0;
+  let sumIntraDepth = 0;
+  let maxInterDepth = 0;
+  let maxCombinedDepth = 0;
+  const interDepthDistribution: Record<number, number> = {};
+  const combinedDepthDistribution: Record<number, { count: number; sumIntra: number }> = {};
+  const depthResults: Array<{
+    txHash: string;
+    blockNumber: number;
+    truncatedDepth: number;
+    intraTxDepth: number;
+    combinedDepth: number;
+    fullChainDepth: number;
+  }> = [];
+
+  for (const tx of txRows) {
+    const interDepth = interTxDepths.get(tx.txHash) ?? 0;
+    const intraDepth = tx.intraTxDepth ?? 0;
+    const combinedDepth = combinedDepths.get(tx.txHash) ?? intraDepth;
+
+    totalTxs++;
+    sumInterDepth += interDepth;
+    sumIntraDepth += intraDepth;
+    maxInterDepth = Math.max(maxInterDepth, interDepth);
+    maxCombinedDepth = Math.max(maxCombinedDepth, combinedDepth);
+
+    // Inter-tx only distribution (for backwards compatibility)
+    interDepthDistribution[interDepth] = (interDepthDistribution[interDepth] ?? 0) + 1;
+
+    // Combined distribution with intra breakdown
+    if (!combinedDepthDistribution[combinedDepth]) {
+      combinedDepthDistribution[combinedDepth] = { count: 0, sumIntra: 0 };
+    }
+    combinedDepthDistribution[combinedDepth].count++;
+    combinedDepthDistribution[combinedDepth].sumIntra += intraDepth;
+
+    if (interDepth > 0) {
+      dependentTxs++;
+    }
+
+    depthResults.push({
+      txHash: tx.txHash,
+      blockNumber: tx.blockNumber,
+      truncatedDepth: interDepth,
+      intraTxDepth: intraDepth,
+      combinedDepth,
+      fullChainDepth: tx.fullChainDepth ?? 0,
+    });
+  }
+
+  const independentTxs = totalTxs - dependentTxs;
+  const parallelismRatio = totalTxs > 0 ? independentTxs / totalTxs : 1;
+  const avgInterDepth = totalTxs > 0 ? sumInterDepth / totalTxs : 0;
+  const avgIntraDepth = totalTxs > 0 ? sumIntraDepth / totalTxs : 0;
+
+  // Convert combined distribution to simpler format with avg intra per bucket
+  const combinedDistSimple: Record<number, { count: number; avgIntra: number }> = {};
+  for (const [depth, data] of Object.entries(combinedDepthDistribution)) {
+    combinedDistSimple[Number(depth)] = {
+      count: data.count,
+      avgIntra: data.count > 0 ? data.sumIntra / data.count : 0,
+    };
+  }
+
+  // Get top depth txs (sorted by combined depth)
+  const topDepthTxs = depthResults
+    .sort((a, b) => b.combinedDepth - a.combinedDepth || b.blockNumber - a.blockNumber)
+    .slice(0, topLimit);
+
+  return jsonResponse({
+    chainId,
+    lookbackBlocks,
+    signatureHash,
+    stats: {
       totalTxs,
       dependentTxs,
       independentTxs,
       parallelismRatio,
-      maxChainDepth: row.maxChainDepth ?? 0,
-      maxTotalDepth: row.maxTotalDepth ?? 0,
-      avgChainDepth: row.avgChainDepth ?? 0,
-      avgTotalDepth: row.avgTotalDepth ?? 0,
-    };
-  });
-
-  return jsonResponse({
-    chainId,
-    chunkSize,
-    signatureHash,
-    chunks,
+      maxTruncatedDepth: maxInterDepth,
+      avgTruncatedDepth: avgInterDepth,
+      maxCombinedDepth,
+      avgCombinedDepth: avgInterDepth + avgIntraDepth,
+      avgIntraDepth,
+      truncatedDepthDistribution: interDepthDistribution,
+      combinedDepthDistribution: combinedDistSimple,
+    },
+    topDepthTxs,
   });
 }
 
@@ -1211,6 +1614,7 @@ function handleDfgStatsBySignature(url: URL): Response {
   const limit = parseNumber(url.searchParams.get("limit"), 20) ?? 20;
   const startBlock = parseNumber(url.searchParams.get("startBlock"));
   const endBlock = parseNumber(url.searchParams.get("endBlock"));
+  const orderBy = url.searchParams.get("orderBy") ?? "frequency";
 
   if (chainId === undefined) {
     return jsonResponse({ error: "chain_id_required" }, 400);
@@ -1231,6 +1635,9 @@ function handleDfgStatsBySignature(url: URL): Response {
     params.$endBlock = endBlock;
   }
 
+  // Determine ORDER BY clause based on orderBy param
+  const orderClause = orderBy === "maxDepth" ? "maxChainDepth DESC, txCount DESC" : "txCount DESC";
+
   const rows = db
     .prepare(
       `SELECT
@@ -1245,7 +1652,7 @@ function handleDfgStatsBySignature(url: URL): Response {
       JOIN dfg_txs t ON t.chain_id = d.chain_id AND t.tx_hash = d.tx_hash
       WHERE ${clauses.join(" AND ")}
       GROUP BY t.signature_hash
-      ORDER BY txCount DESC
+      ORDER BY ${orderClause}
       LIMIT $limit`,
     )
     .all(params) as Array<{
@@ -1276,6 +1683,7 @@ function handleDfgStatsBySignature(url: URL): Response {
 
   return jsonResponse({
     chainId,
+    orderBy,
     signatures,
   });
 }
@@ -1313,10 +1721,14 @@ Bun.serve({
         return handleDfgRollup(url);
       case "/dfg/export":
         return handleDfgExport(url);
-      case "/dfg/stats/chunks":
-        return handleDfgStatsChunks(url);
+      case "/dfg/stats/horizon":
+        return handleDfgStatsHorizon(url);
       case "/dfg/stats/by-signature":
         return handleDfgStatsBySignature(url);
+      case "/dfg/stats/window":
+        return handleDfgStatsWindow(url);
+      case "/dfg/pattern":
+        return handleDfgPattern(url);
       default:
         return jsonResponse(
           {
@@ -1334,8 +1746,10 @@ Bun.serve({
               "/dfg/tx",
               "/dfg/signatures",
               "/dfg/stats",
-              "/dfg/stats/chunks",
+              "/dfg/stats/horizon",
               "/dfg/stats/by-signature",
+              "/dfg/stats/window",
+              "/dfg/pattern",
               "/dfg/rollup",
               "/dfg/export",
             ],

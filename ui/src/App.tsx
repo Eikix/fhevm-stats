@@ -3,7 +3,6 @@ import {
   type FormEvent,
   type MouseEvent,
   type WheelEvent,
-  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -166,6 +165,8 @@ type DfgTxResponse = {
   nodes: DfgNode[];
   edges: DfgEdge[];
   inputs: DfgInput[];
+  cutEdges?: CutEdge[];
+  lookbackBlocks?: number;
 };
 
 type OpTypeRow = {
@@ -179,40 +180,41 @@ type OpTypesResponse = {
   totals?: Array<{ eventName: string; count: number }>;
 };
 
-type ChunkStats = {
-  startBlock: number;
-  endBlock: number;
-  totalTxs: number;
-  dependentTxs: number;
-  independentTxs: number;
-  parallelismRatio: number;
-  maxChainDepth: number;
-  maxTotalDepth: number;
-  avgChainDepth: number;
-  avgTotalDepth: number;
-};
-
-type ChunksResponse = {
+type WindowStatsResponse = {
   chainId: number;
-  chunkSize: number;
+  lookbackBlocks: number;
   signatureHash?: string;
-  chunks: ChunkStats[];
+  stats: {
+    totalTxs: number;
+    dependentTxs: number;
+    independentTxs: number;
+    parallelismRatio: number;
+    maxTruncatedDepth: number;
+    avgTruncatedDepth: number;
+    maxCombinedDepth: number;
+    avgCombinedDepth: number;
+    avgIntraDepth: number;
+    truncatedDepthDistribution: Record<number, number>;
+    combinedDepthDistribution: Record<
+      number,
+      { count: number; avgIntra: number }
+    >;
+  };
+  topDepthTxs: Array<{
+    txHash: string;
+    blockNumber: number;
+    truncatedDepth: number;
+    intraTxDepth: number;
+    combinedDepth: number;
+    fullChainDepth: number;
+  }>;
 };
 
-type SignatureDepStats = {
-  signatureHash: string;
-  txCount: number;
-  dependentTxs: number;
-  parallelismRatio: number;
-  avgChainDepth: number;
-  avgTotalDepth: number;
-  maxChainDepth: number;
-  maxTotalDepth: number;
-};
-
-type BySignatureResponse = {
-  chainId: number;
-  signatures: SignatureDepStats[];
+type CutEdge = {
+  handle: string;
+  producerTxHash: string;
+  producerBlock: number;
+  windowStart: number;
 };
 
 type NetworkOption = {
@@ -232,7 +234,15 @@ const NETWORKS: NetworkOption[] = [
   { id: "mainnet", label: "Mainnet", chainId: 1 },
   { id: "sepolia", label: "Sepolia", chainId: 11155111 },
 ];
-const PIE_COLORS = ["#0f766e", "#0b4f4a", "#f59e0b", "#b45309", "#0ea5e9", "#1d4ed8", "#ef4444"];
+const PIE_COLORS = [
+  "#0f766e",
+  "#0b4f4a",
+  "#f59e0b",
+  "#b45309",
+  "#0ea5e9",
+  "#1d4ed8",
+  "#ef4444",
+];
 const PIE_LIMIT = 6;
 const OP_TYPE_ROLES: Array<{ id: "result" | "lhs" | "rhs"; label: string }> = [
   { id: "result", label: "Result" },
@@ -346,8 +356,12 @@ function formatNumber(value: number | null | undefined): string {
   return value.toLocaleString();
 }
 
-function formatRange(min: number | null | undefined, max: number | null | undefined): string {
-  if (min === null || min === undefined || max === null || max === undefined) return "—";
+function formatRange(
+  min: number | null | undefined,
+  max: number | null | undefined,
+): string {
+  if (min === null || min === undefined || max === null || max === undefined)
+    return "—";
   return `${min.toLocaleString()} → ${max.toLocaleString()}`;
 }
 
@@ -358,7 +372,10 @@ function formatFheType(value: number | null | undefined): string {
   return `e${name.charAt(0).toLowerCase()}${name.slice(1)}`;
 }
 
-function resolveEdgeType(edge: DfgEdge, nodeById: Map<number, DfgNode>): number | null {
+function resolveEdgeType(
+  edge: DfgEdge,
+  nodeById: Map<number, DfgNode>,
+): number | null {
   const toNode = nodeById.get(edge.toNodeId);
   const inputType = toNode?.typeInfo?.inputs?.find(
     (input) => input.handle === edge.inputHandle,
@@ -375,7 +392,11 @@ function formatOpTypeValue(value: string): string {
   return formatFheType(parsed);
 }
 
-function shortenHandle(value: string | null | undefined, head = 6, tail = 4): string {
+function shortenHandle(
+  value: string | null | undefined,
+  head = 6,
+  tail = 4,
+): string {
   if (!value) return "—";
   if (value.length <= head + tail + 2) return value;
   return `${value.slice(0, head + 2)}...${value.slice(-tail)}`;
@@ -389,7 +410,8 @@ function formatPercent(value: number): string {
 }
 
 function formatDecimal(value: number | null | undefined, digits = 1): string {
-  if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+  if (value === null || value === undefined || !Number.isFinite(value))
+    return "—";
   return Number(value.toFixed(digits)).toLocaleString();
 }
 
@@ -414,20 +436,27 @@ function formatRelativeTime(value: string | null | undefined): string {
 }
 
 function App() {
-  const [summary, setSummary] = useState<SummaryResponse["summary"] | null>(null);
+  const [summary, setSummary] = useState<SummaryResponse["summary"] | null>(
+    null,
+  );
   const [ops, setOps] = useState<OpsResponse["rows"]>([]);
-  const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [status, setStatus] = useState<"loading" | "ready" | "error">(
+    "loading",
+  );
   const [error, setError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [ingestion, setIngestion] = useState<IngestionResponse | null>(null);
-  const [ingestionStatus, setIngestionStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [ingestionStatus, setIngestionStatus] = useState<
+    "loading" | "ready" | "error"
+  >("loading");
   const [ingestionError, setIngestionError] = useState<string | null>(null);
   const [networkId, setNetworkId] = useState<NetworkOption["id"]>("mainnet");
   const [dfgTxs, setDfgTxs] = useState<DfgTxSummary[]>([]);
   const [dfgTotal, setDfgTotal] = useState(0);
-  const [dfgStatus, setDfgStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
-  const [dfgError, setDfgError] = useState<string | null>(null);
+  const [dfgStatus, setDfgStatus] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle");
   const [dfgSelection, setDfgSelection] = useState<string | null>(null);
   const dfgSelectionRef = useRef<string | null>(null);
   useEffect(() => {
@@ -435,55 +464,46 @@ function App() {
   }, [dfgSelection]);
   const [dfgQuery, setDfgQuery] = useState("");
   const [dfgDetail, setDfgDetail] = useState<DfgTxResponse | null>(null);
-  const [dfgDetailStatus, setDfgDetailStatus] = useState<"idle" | "loading" | "ready" | "error">(
-    "idle",
-  );
+  const [dfgDetailStatus, setDfgDetailStatus] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle");
   const [dfgDetailError, setDfgDetailError] = useState<string | null>(null);
-  const [dfgSignatureSelection, setDfgSignatureSelection] = useState<string | null>(null);
+  const [dfgSignatureSelection, setDfgSignatureSelection] = useState<
+    string | null
+  >(null);
   const [dfgSignatures, setDfgSignatures] = useState<DfgSignatureRow[]>([]);
   const [dfgSignatureTotal, setDfgSignatureTotal] = useState(0);
   const [dfgSignatureStatus, setDfgSignatureStatus] = useState<
     "idle" | "loading" | "ready" | "error"
   >("idle");
-  const [dfgSignatureError, setDfgSignatureError] = useState<string | null>(null);
+  const [dfgSignatureError, setDfgSignatureError] = useState<string | null>(
+    null,
+  );
   const [dfgSignatureMinNodes, setDfgSignatureMinNodes] = useState(2);
   const [dfgSignatureMinEdges, setDfgSignatureMinEdges] = useState(1);
   const [dfgStats, setDfgStats] = useState<DfgStatsResponse | null>(null);
-  const [dfgStatsStatus, setDfgStatsStatus] = useState<"idle" | "loading" | "ready" | "error">(
-    "idle",
-  );
-  const [dfgStatsError, setDfgStatsError] = useState<string | null>(null);
-  const [dfgDeps, setDfgDeps] = useState<DfgStatsResponse["deps"] | null>(null);
-  const [dfgDepsStatus, setDfgDepsStatus] = useState<"idle" | "loading" | "ready" | "error">(
-    "idle",
-  );
-  const [dfgDepsError, setDfgDepsError] = useState<string | null>(null);
-  const [horizonMode, setHorizonMode] = useState<"all" | "block" | "range">("all");
-  const [horizonBlocks, setHorizonBlocks] = useState(10);
-  const [depthMode, setDepthMode] = useState<"inter" | "total">("inter");
-  const depsLoadedOnceRef = useRef(false);
-
-  // View mode: single range vs rolling chunks
-  const [depsViewMode, setDepsViewMode] = useState<"single" | "chunks">("single");
-
-  // Chunk settings
-  const [chunkSize, setChunkSize] = useState(100);
-  const [chunksData, setChunksData] = useState<ChunkStats[]>([]);
-  const [chunksStatus, setChunksStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
-  const [chunksError, setChunksError] = useState<string | null>(null);
-
-  // Pattern filter
-  const [signatureFilter, setSignatureFilter] = useState<string | null>(null);
-  const [signatureOptions, setSignatureOptions] = useState<SignatureDepStats[]>([]);
-  const [signatureOptionsStatus, setSignatureOptionsStatus] = useState<
+  const [dfgStatsStatus, setDfgStatsStatus] = useState<
     "idle" | "loading" | "ready" | "error"
   >("idle");
-  const [dfgRollup, setDfgRollup] = useState<DfgRollupResponse | null>(null);
-  const [dfgRollupStatus, setDfgRollupStatus] = useState<"idle" | "loading" | "ready" | "error">(
-    "idle",
+  const [dfgStatsError, setDfgStatsError] = useState<string | null>(null);
+
+  // Rolling window settings (V5: truncated depth visualization)
+  const [windowLookback, setWindowLookback] = useState(50);
+  const [windowStats, setWindowStats] = useState<WindowStatsResponse | null>(
+    null,
   );
+  const [windowStatus, setWindowStatus] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle");
+  const [windowError, setWindowError] = useState<string | null>(null);
+  const [dfgLookback, setDfgLookback] = useState<number | null>(null);
+
+  const [dfgRollup, setDfgRollup] = useState<DfgRollupResponse | null>(null);
+  const [dfgRollupStatus, setDfgRollupStatus] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle");
   const [dfgRollupError, setDfgRollupError] = useState<string | null>(null);
-  const [dfgGraphView, setDfgGraphView] = useState(false);
+  const [dfgGraphView] = useState(true);
   const [dfgViewBox, setDfgViewBox] = useState<ViewBox | null>(null);
   const [dfgDragging, setDfgDragging] = useState(false);
   const dfgViewerRef = useRef<HTMLDivElement | null>(null);
@@ -492,14 +512,20 @@ function App() {
     startY: number;
     viewBox: ViewBox;
   } | null>(null);
-  const [opTypeRole, setOpTypeRole] = useState<"result" | "lhs" | "rhs">("result");
+  const dfgSvgRef = useRef<SVGSVGElement | null>(null);
+  const [opTypeRole, setOpTypeRole] = useState<"result" | "lhs" | "rhs">(
+    "result",
+  );
   const [opTypes, setOpTypes] = useState<OpTypeRow[]>([]);
-  const [opTypeStatus, setOpTypeStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [opTypeStatus, setOpTypeStatus] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle");
   const [opTypeError, setOpTypeError] = useState<string | null>(null);
   const [opTypeFilter, setOpTypeFilter] = useState("");
   const [opTypeTotals, setOpTypeTotals] = useState<Record<string, number>>({});
 
-  const activeNetwork = NETWORKS.find((network) => network.id === networkId) ?? NETWORKS[0];
+  const activeNetwork =
+    NETWORKS.find((network) => network.id === networkId) ?? NETWORKS[0];
   const chainId = activeNetwork.chainId;
 
   useEffect(() => {
@@ -512,8 +538,14 @@ function App() {
       setError(null);
       try {
         const [summaryResponse, opsResponse] = await Promise.all([
-          fetchJson<SummaryResponse>(`${API_BASE}/stats/summary?${query}`, controller.signal),
-          fetchJson<OpsResponse>(`${API_BASE}/stats/ops?${query}`, controller.signal),
+          fetchJson<SummaryResponse>(
+            `${API_BASE}/stats/summary?${query}`,
+            controller.signal,
+          ),
+          fetchJson<OpsResponse>(
+            `${API_BASE}/stats/ops?${query}`,
+            controller.signal,
+          ),
         ]);
 
         if (controller.signal.aborted) return;
@@ -552,7 +584,11 @@ function App() {
       })
       .catch((err) => {
         if (err instanceof Error && err.name === "AbortError") return;
-        setIngestionError(err instanceof Error ? err.message : "Failed to load ingestion status.");
+        setIngestionError(
+          err instanceof Error
+            ? err.message
+            : "Failed to load ingestion status.",
+        );
         setIngestionStatus("error");
       });
 
@@ -590,7 +626,9 @@ function App() {
         setOpTypeStatus("ready");
       } catch (err) {
         if (controller.signal.aborted) return;
-        setOpTypeError(err instanceof Error ? err.message : "Failed to load op types.");
+        setOpTypeError(
+          err instanceof Error ? err.message : "Failed to load op types.",
+        );
         setOpTypeStatus("error");
       }
     };
@@ -612,7 +650,6 @@ function App() {
 
     const load = async () => {
       setDfgStatus("loading");
-      setDfgError(null);
       try {
         const response = await fetchJson<DfgTxsResponse>(
           `${API_BASE}/dfg/txs?${params.toString()}`,
@@ -626,15 +663,16 @@ function App() {
         setDfgStatus("ready");
         if (rows.length > 0) {
           const current = dfgSelectionRef.current;
-          const exists = current ? rows.some((row) => row.txHash === current) : false;
+          const exists = current
+            ? rows.some((row) => row.txHash === current)
+            : false;
           if (!exists) {
             setDfgSelection(rows[0].txHash);
             setDfgQuery(rows[0].txHash);
           }
         }
-      } catch (err) {
+      } catch {
         if (controller.signal.aborted) return;
-        setDfgError(err instanceof Error ? err.message : "Failed to load DFGs.");
         setDfgStatus("error");
       }
     };
@@ -668,7 +706,9 @@ function App() {
         setDfgSignatureStatus("ready");
       } catch (err) {
         if (controller.signal.aborted) return;
-        setDfgSignatureError(err instanceof Error ? err.message : "Failed to load signatures.");
+        setDfgSignatureError(
+          err instanceof Error ? err.message : "Failed to load signatures.",
+        );
         setDfgSignatureStatus("error");
       }
     };
@@ -696,18 +736,11 @@ function App() {
         if (controller.signal.aborted) return;
         setDfgStats(response);
         setDfgStatsStatus("ready");
-        if (response.deps) {
-          setDfgDeps(response.deps);
-          setDfgDepsStatus("ready");
-          setDfgDepsError(null);
-        } else {
-          setDfgDeps(null);
-          setDfgDepsStatus("idle");
-          setDfgDepsError(null);
-        }
       } catch (err) {
         if (controller.signal.aborted) return;
-        setDfgStatsError(err instanceof Error ? err.message : "Failed to load DFG stats.");
+        setDfgStatsError(
+          err instanceof Error ? err.message : "Failed to load DFG stats.",
+        );
         setDfgStatsStatus("error");
       }
     };
@@ -716,134 +749,37 @@ function App() {
     return () => controller.abort();
   }, [chainId, refreshKey]);
 
-  const loadDfgDeps = useCallback(() => {
-    if (dfgDepsStatus === "loading") return;
-    const controller = new AbortController();
-    const params = new URLSearchParams();
-    params.set("chainId", chainId.toString());
-    params.set("includeDeps", "1");
-    params.set("depthMode", depthMode);
-    params.set("cacheBust", refreshKey.toString());
-
-    // Apply horizon filter - use maxDepsBlock (latest block with dependency data)
-    const maxBlock = dfgStats?.maxDepsBlock;
-    if (horizonMode !== "all" && maxBlock !== null && maxBlock !== undefined) {
-      if (horizonMode === "block") {
-        // Single latest block with data
-        params.set("startBlock", maxBlock.toString());
-        params.set("endBlock", maxBlock.toString());
-      } else if (horizonMode === "range") {
-        // Last N blocks with data
-        const startBlock = Math.max(0, maxBlock - horizonBlocks + 1);
-        params.set("startBlock", startBlock.toString());
-        params.set("endBlock", maxBlock.toString());
-      }
-    }
-
-    // Pattern filter
-    if (signatureFilter) {
-      params.set("signatureHash", signatureFilter);
-    }
-
-    setDfgDepsStatus("loading");
-    setDfgDepsError(null);
-    fetchJson<DfgStatsResponse>(`${API_BASE}/dfg/stats?${params.toString()}`, controller.signal)
-      .then((response) => {
-        setDfgDeps(response.deps ?? null);
-        setDfgDepsStatus("ready");
-        depsLoadedOnceRef.current = true;
-      })
-      .catch((err) => {
-        if (err instanceof Error && err.name === "AbortError") return;
-        setDfgDepsError(err instanceof Error ? err.message : "Failed to load dependency stats.");
-        setDfgDepsStatus("error");
-      });
-  }, [
-    chainId,
-    depthMode,
-    dfgDepsStatus,
-    dfgStats?.maxDepsBlock,
-    horizonBlocks,
-    horizonMode,
-    refreshKey,
-    signatureFilter,
-  ]);
-
-  // Load chunks data for rolling view
-  const loadChunks = useCallback(() => {
-    if (chunksStatus === "loading") return;
-    const controller = new AbortController();
-    const params = new URLSearchParams();
-    params.set("chainId", chainId.toString());
-    params.set("chunkSize", chunkSize.toString());
-    params.set("limit", "50");
-    params.set("cacheBust", refreshKey.toString());
-
-    if (signatureFilter) {
-      params.set("signatureHash", signatureFilter);
-    }
-
-    setChunksStatus("loading");
-    setChunksError(null);
-    fetchJson<ChunksResponse>(
-      `${API_BASE}/dfg/stats/chunks?${params.toString()}`,
-      controller.signal,
-    )
-      .then((response) => {
-        setChunksData(response.chunks ?? []);
-        setChunksStatus("ready");
-      })
-      .catch((err) => {
-        if (err instanceof Error && err.name === "AbortError") return;
-        setChunksError(err instanceof Error ? err.message : "Failed to load chunks.");
-        setChunksStatus("error");
-      });
-  }, [chainId, chunkSize, chunksStatus, refreshKey, signatureFilter]);
-
-  // Load signature options for pattern dropdown
+  // Load rolling window stats when lookback/chain changes (after DFG stats ready)
   useEffect(() => {
+    if (dfgStatsStatus !== "ready") return;
+
     const controller = new AbortController();
     const params = new URLSearchParams();
     params.set("chainId", chainId.toString());
-    params.set("limit", "50");
+    params.set("lookbackBlocks", windowLookback.toString());
+    params.set("topLimit", "10");
     params.set("cacheBust", refreshKey.toString());
 
-    setSignatureOptionsStatus("loading");
-    fetchJson<BySignatureResponse>(
-      `${API_BASE}/dfg/stats/by-signature?${params.toString()}`,
+    setWindowStatus("loading");
+    setWindowError(null);
+    fetchJson<WindowStatsResponse>(
+      `${API_BASE}/dfg/stats/window?${params.toString()}`,
       controller.signal,
     )
       .then((response) => {
-        setSignatureOptions(response.signatures ?? []);
-        setSignatureOptionsStatus("ready");
+        setWindowStats(response);
+        setWindowStatus("ready");
       })
       .catch((err) => {
         if (err instanceof Error && err.name === "AbortError") return;
-        setSignatureOptionsStatus("error");
+        setWindowError(
+          err instanceof Error ? err.message : "Failed to load window stats.",
+        );
+        setWindowStatus("error");
       });
 
     return () => controller.abort();
-  }, [chainId, refreshKey]);
-
-  // Auto-reload dependency stats when horizon, depth mode, or signature filter changes (only if already loaded)
-  const horizonModeRef = useRef(horizonMode);
-  const horizonBlocksRef = useRef(horizonBlocks);
-  const depthModeRef = useRef(depthMode);
-  const signatureFilterRef = useRef(signatureFilter);
-  useEffect(() => {
-    const changed =
-      horizonModeRef.current !== horizonMode ||
-      horizonBlocksRef.current !== horizonBlocks ||
-      depthModeRef.current !== depthMode ||
-      signatureFilterRef.current !== signatureFilter;
-    horizonModeRef.current = horizonMode;
-    horizonBlocksRef.current = horizonBlocks;
-    depthModeRef.current = depthMode;
-    signatureFilterRef.current = signatureFilter;
-    if (changed && depsLoadedOnceRef.current && depsViewMode === "single") {
-      loadDfgDeps();
-    }
-  }, [horizonMode, horizonBlocks, depthMode, signatureFilter, loadDfgDeps, depsViewMode]);
+  }, [windowLookback, dfgStatsStatus, chainId, refreshKey]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -866,7 +802,9 @@ function App() {
         setDfgRollupStatus("ready");
       } catch (err) {
         if (controller.signal.aborted) return;
-        setDfgRollupError(err instanceof Error ? err.message : "Failed to load DFG rollup.");
+        setDfgRollupError(
+          err instanceof Error ? err.message : "Failed to load DFG rollup.",
+        );
         setDfgRollupStatus("error");
       }
     };
@@ -886,6 +824,9 @@ function App() {
     params.set("chainId", chainId.toString());
     params.set("txHash", dfgSelection);
     params.set("cacheBust", cacheBust.toString());
+    if (dfgLookback !== null) {
+      params.set("lookbackBlocks", dfgLookback.toString());
+    }
 
     const load = async () => {
       setDfgDetailStatus("loading");
@@ -901,14 +842,16 @@ function App() {
         setDfgDetailStatus("ready");
       } catch (err) {
         if (controller.signal.aborted) return;
-        setDfgDetailError(err instanceof Error ? err.message : "Failed to load DFG details.");
+        setDfgDetailError(
+          err instanceof Error ? err.message : "Failed to load DFG details.",
+        );
         setDfgDetailStatus("error");
       }
     };
 
     load();
     return () => controller.abort();
-  }, [chainId, refreshKey, dfgSelection]);
+  }, [chainId, refreshKey, dfgSelection, dfgLookback]);
 
   const topOps = useMemo(() => ops.slice(0, 10), [ops]);
   const maxOps = useMemo(() => {
@@ -1034,7 +977,10 @@ function App() {
 
   const dfgRollupTotalNodes = useMemo(() => {
     if (!dfgRollupStats?.opCounts) return 0;
-    return Object.values(dfgRollupStats.opCounts).reduce((sum, value) => sum + value, 0);
+    return Object.values(dfgRollupStats.opCounts).reduce(
+      (sum, value) => sum + value,
+      0,
+    );
   }, [dfgRollupStats]);
 
   const dfgRollupInputTotals = useMemo(() => {
@@ -1066,7 +1012,13 @@ function App() {
   const dfgGraph = useMemo(() => {
     if (!dfgGraphView || dfgNodes.length === 0) return null;
     const graph = new dagre.graphlib.Graph({ multigraph: true });
-    graph.setGraph({ rankdir: "LR", nodesep: 28, ranksep: 80, marginx: 20, marginy: 20 });
+    graph.setGraph({
+      rankdir: "LR",
+      nodesep: 28,
+      ranksep: 80,
+      marginx: 20,
+      marginy: 20,
+    });
     graph.setDefaultEdgeLabel(() => ({}));
 
     const nodeWidth = 140;
@@ -1076,13 +1028,24 @@ function App() {
     const edgeLabels = new Map<string, string | null>();
 
     for (const node of dfgNodes) {
-      graph.setNode(String(node.nodeId), { width: nodeWidth, height: nodeHeight, label: node.op });
+      graph.setNode(String(node.nodeId), {
+        width: nodeWidth,
+        height: nodeHeight,
+        label: node.op,
+      });
     }
     dfgEdges.forEach((edge, index) => {
       const type = resolveEdgeType(edge, nodeById);
-      edgeLabels.set(`e${index}`, type === null || type === undefined ? null : formatFheType(type));
+      edgeLabels.set(
+        `e${index}`,
+        type === null || type === undefined ? null : formatFheType(type),
+      );
       graph.setEdge(
-        { v: String(edge.fromNodeId), w: String(edge.toNodeId), name: `e${index}` },
+        {
+          v: String(edge.fromNodeId),
+          w: String(edge.toNodeId),
+          name: `e${index}`,
+        },
         {},
       );
     });
@@ -1151,30 +1114,61 @@ function App() {
     setDfgViewBox(dfgGraph.viewBox);
   }, [dfgGraph]);
 
-  const handleGraphWheel = (event: WheelEvent<SVGSVGElement>) => {
-    if (!dfgGraph || !dfgViewBox) return;
-    event.preventDefault();
-    const rect = event.currentTarget.getBoundingClientRect();
-    const pointX = dfgViewBox.x + ((event.clientX - rect.left) / rect.width) * dfgViewBox.width;
-    const pointY = dfgViewBox.y + ((event.clientY - rect.top) / rect.height) * dfgViewBox.height;
-    const scale = event.deltaY > 0 ? 1.12 : 0.9;
+  // Store current values in refs for the native wheel event listener
+  const dfgGraphRef = useRef(dfgGraph);
+  const dfgViewBoxRef = useRef(dfgViewBox);
+  useEffect(() => {
+    dfgGraphRef.current = dfgGraph;
+  }, [dfgGraph]);
+  useEffect(() => {
+    dfgViewBoxRef.current = dfgViewBox;
+  }, [dfgViewBox]);
 
-    const base = dfgGraph.viewBox;
-    const nextWidth = dfgViewBox.width * scale;
-    const nextHeight = dfgViewBox.height * scale;
-    const minWidth = base.width * 0.15;
-    const minHeight = base.height * 0.15;
-    const maxWidth = base.width * 5;
-    const maxHeight = base.height * 5;
-    const clampedWidth = Math.min(Math.max(nextWidth, minWidth), maxWidth);
-    const clampedHeight = Math.min(Math.max(nextHeight, minHeight), maxHeight);
-    const ratioX = clampedWidth / dfgViewBox.width;
-    const ratioY = clampedHeight / dfgViewBox.height;
+  // Attach non-passive wheel listener to prevent page scroll while zooming
+  useEffect(() => {
+    const svg = dfgSvgRef.current;
+    if (!svg) return;
 
-    const nextX = pointX - (pointX - dfgViewBox.x) * ratioX;
-    const nextY = pointY - (pointY - dfgViewBox.y) * ratioY;
-    setDfgViewBox({ x: nextX, y: nextY, width: clampedWidth, height: clampedHeight });
-  };
+    const handleWheel = (event: WheelEvent) => {
+      const graph = dfgGraphRef.current;
+      const viewBox = dfgViewBoxRef.current;
+      if (!graph || !viewBox) return;
+      event.preventDefault();
+      const rect = svg.getBoundingClientRect();
+      const pointX =
+        viewBox.x + ((event.clientX - rect.left) / rect.width) * viewBox.width;
+      const pointY =
+        viewBox.y + ((event.clientY - rect.top) / rect.height) * viewBox.height;
+      const scale = event.deltaY > 0 ? 1.12 : 0.9;
+
+      const base = graph.viewBox;
+      const nextWidth = viewBox.width * scale;
+      const nextHeight = viewBox.height * scale;
+      const minWidth = base.width * 0.15;
+      const minHeight = base.height * 0.15;
+      const maxWidth = base.width * 5;
+      const maxHeight = base.height * 5;
+      const clampedWidth = Math.min(Math.max(nextWidth, minWidth), maxWidth);
+      const clampedHeight = Math.min(
+        Math.max(nextHeight, minHeight),
+        maxHeight,
+      );
+      const ratioX = clampedWidth / viewBox.width;
+      const ratioY = clampedHeight / viewBox.height;
+
+      const nextX = pointX - (pointX - viewBox.x) * ratioX;
+      const nextY = pointY - (pointY - viewBox.y) * ratioY;
+      setDfgViewBox({
+        x: nextX,
+        y: nextY,
+        width: clampedWidth,
+        height: clampedHeight,
+      });
+    };
+
+    svg.addEventListener("wheel", handleWheel, { passive: false });
+    return () => svg.removeEventListener("wheel", handleWheel);
+  }, [dfgGraphView, dfgSelected]);
 
   const handleGraphMouseDown = (event: MouseEvent<SVGSVGElement>) => {
     if (!dfgViewBox) return;
@@ -1221,8 +1215,12 @@ function App() {
         : "border-emerald-200 bg-emerald-50 text-emerald-700";
 
   const ingestionAge = useMemo(() => {
-    if (!ingestion?.events.lastEventAt || ingestionStatus !== "ready") return null;
-    return Date.now() - new Date(normalizeTimestamp(ingestion.events.lastEventAt)).getTime();
+    if (!ingestion?.events.lastEventAt || ingestionStatus !== "ready")
+      return null;
+    return (
+      Date.now() -
+      new Date(normalizeTimestamp(ingestion.events.lastEventAt)).getTime()
+    );
   }, [ingestion?.events.lastEventAt, ingestionStatus]);
   const ingestionStale =
     ingestionAge === null
@@ -1249,18 +1247,28 @@ function App() {
       <div className="mx-auto max-w-6xl px-6 py-12">
         <div className="grid gap-8 lg:grid-cols-[1.1fr_0.9fr]">
           <section className="glass-panel rounded-[28px] p-8 fade-in-up">
-            <p className="muted-text text-xs uppercase tracking-[0.4em]">fhevm stats</p>
-            <h1 className="font-display mt-4 text-4xl md:text-5xl">Encrypted ops, clear view.</h1>
+            <p className="muted-text text-xs uppercase tracking-[0.4em]">
+              fhevm stats
+            </p>
+            <h1 className="font-display mt-4 text-4xl md:text-5xl">
+              Encrypted ops, clear view.
+            </h1>
             <p className="muted-text mt-4 max-w-xl text-base">
-              Lightweight telemetry for FHEVMExecutor activity. Raw events first, bucketed rollups
-              when it counts.
+              Lightweight telemetry for FHEVMExecutor activity. Raw events
+              first, bucketed rollups when it counts.
             </p>
 
             <div className="mt-6 flex flex-wrap items-center gap-3 text-xs uppercase tracking-[0.2em]">
               <span className={`rounded-full border px-3 py-1 ${statusBadge}`}>
-                {status === "error" ? "API error" : status === "loading" ? "Syncing" : "Live"}
+                {status === "error"
+                  ? "API error"
+                  : status === "loading"
+                    ? "Syncing"
+                    : "Live"}
               </span>
-              <span className={`rounded-full border px-3 py-1 ${ingestionBadge}`}>
+              <span
+                className={`rounded-full border px-3 py-1 ${ingestionBadge}`}
+              >
                 {ingestionStatus === "error"
                   ? "Ingestion error"
                   : ingestionStatus === "loading"
@@ -1311,8 +1319,8 @@ function App() {
               </span>
               {ingestionStatus === "ready" ? (
                 <span className="muted-text text-xs uppercase tracking-[0.18em]">
-                  Last event {formatRelativeTime(ingestion?.events.lastEventAt)} · block{" "}
-                  {formatNumber(ingestion?.events.maxBlock)}
+                  Last event {formatRelativeTime(ingestion?.events.lastEventAt)}{" "}
+                  · block {formatNumber(ingestion?.events.maxBlock)}
                 </span>
               ) : ingestionStatus === "error" ? (
                 <span className="muted-text text-xs uppercase tracking-[0.18em]">
@@ -1335,8 +1343,12 @@ function App() {
                 className="glass-panel rounded-2xl p-6 fade-in-up"
                 style={{ animationDelay: `${120 + index * 80}ms` }}
               >
-                <p className="muted-text text-xs uppercase tracking-[0.32em]">{card.label}</p>
-                <p className="font-code mt-3 text-2xl md:text-3xl">{card.value}</p>
+                <p className="muted-text text-xs uppercase tracking-[0.32em]">
+                  {card.label}
+                </p>
+                <p className="font-code mt-3 text-2xl md:text-3xl">
+                  {card.value}
+                </p>
                 <p className="muted-text mt-3 text-sm">{card.detail}</p>
               </div>
             ))}
@@ -1346,8 +1358,20 @@ function App() {
         <section className="glass-panel mt-10 rounded-[28px] p-8 fade-in-up">
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div>
-              <p className="muted-text text-xs uppercase tracking-[0.3em]">Ops distribution</p>
-              <h2 className="font-display mt-3 text-2xl">Top events by volume</h2>
+              <p className="muted-text group relative inline-flex items-center gap-1 text-xs uppercase tracking-[0.3em]">
+                Ops distribution
+                <span className="cursor-help text-black/30 hover:text-black/50">
+                  ⓘ
+                </span>
+                <span className="pointer-events-none absolute left-0 top-full z-10 mt-1 w-64 rounded bg-black/80 px-2 py-1.5 text-[10px] normal-case tracking-normal text-white opacity-0 transition-opacity group-hover:opacity-100">
+                  Raw count of ALL FHE events emitted on-chain from the
+                  fhe_events table. This is the source of truth for on-chain
+                  activity.
+                </span>
+              </p>
+              <h2 className="font-display mt-3 text-2xl">
+                Top events by volume
+              </h2>
             </div>
             <p className="muted-text text-xs uppercase tracking-[0.2em]">
               Showing {topOps.length || 0} of {ops.length}
@@ -1361,8 +1385,12 @@ function App() {
                 style={{ background: pieGradient }}
               >
                 <div className="absolute flex h-32 w-32 flex-col items-center justify-center rounded-full border border-black/10 bg-white/85 text-center">
-                  <span className="muted-text text-[11px] uppercase tracking-[0.3em]">Total</span>
-                  <span className="font-code text-xl">{formatNumber(totalOps)}</span>
+                  <span className="muted-text text-[11px] uppercase tracking-[0.3em]">
+                    Total
+                  </span>
+                  <span className="font-code text-xl">
+                    {formatNumber(totalOps)}
+                  </span>
                 </div>
               </div>
 
@@ -1373,13 +1401,18 @@ function App() {
                   </p>
                 ) : (
                   pieSegments.map((segment) => (
-                    <div key={segment.label} className="flex items-center justify-between gap-3">
+                    <div
+                      key={segment.label}
+                      className="flex items-center justify-between gap-3"
+                    >
                       <div className="flex items-center gap-3">
                         <span
                           className="h-2.5 w-2.5 rounded-full"
                           style={{ background: segment.color }}
                         />
-                        <span className="text-sm font-semibold">{segment.label}</span>
+                        <span className="text-sm font-semibold">
+                          {segment.label}
+                        </span>
                       </div>
                       <span className="font-code text-xs">
                         {formatPercent((segment.count / totalOps) * 100)}
@@ -1405,13 +1438,16 @@ function App() {
                       animationDelay: `${index * 60}ms`,
                     }}
                   >
-                    <span className="text-sm font-semibold">{row.eventName}</span>
+                    <span className="text-sm font-semibold">
+                      {row.eventName}
+                    </span>
                     <div className="h-2 rounded-full bg-black/10">
                       <div
                         className="h-2 rounded-full"
                         style={{
-                          width: `${Math.max((row.count / maxOps) * 100, 6)}%`,
-                          background: "linear-gradient(90deg, var(--accent), var(--accent-strong))",
+                          width: `${Math.max((row.count / maxOps) * 100, 0.5)}%`,
+                          background:
+                            "linear-gradient(90deg, var(--accent), var(--accent-strong))",
                         }}
                       />
                     </div>
@@ -1428,7 +1464,22 @@ function App() {
         <section className="glass-panel mt-10 rounded-[28px] p-8 fade-in-up">
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div>
-              <p className="muted-text text-xs uppercase tracking-[0.3em]">Op types</p>
+              <p className="muted-text group relative inline-flex items-center gap-1 text-xs uppercase tracking-[0.3em]">
+                Op types
+                <span className="cursor-help text-black/30 hover:text-black/50">
+                  ⓘ
+                </span>
+                <span className="pointer-events-none absolute left-0 top-full z-10 mt-1 w-72 rounded bg-black/80 px-2 py-1.5 text-[10px] normal-case tracking-normal text-white opacity-0 transition-opacity group-hover:opacity-100">
+                  FHE type distribution by operand role:
+                  <br />
+                  <b>Result</b>: output type produced by the op.
+                  <br />
+                  <b>LHS</b>: left operand type (first input).
+                  <br />
+                  <b>RHS</b>: right operand type (second input), includes scalar
+                  (plaintext) values.
+                </span>
+              </p>
               <h2 className="font-display mt-3 text-2xl">Type usage per op</h2>
             </div>
             <p className="muted-text text-xs uppercase tracking-[0.2em]">
@@ -1440,8 +1491,7 @@ function App() {
             </p>
           </div>
           <p className="muted-text mt-3 max-w-2xl text-sm">
-            Types are decoded from handle metadata. Scalar appears only for RHS when the op uses a
-            scalar operand.
+            Types are decoded from handle metadata.
           </p>
 
           <div className="mt-6 flex flex-wrap items-center gap-3 text-xs uppercase tracking-[0.2em]">
@@ -1454,7 +1504,9 @@ function App() {
                     type="button"
                     onClick={() => setOpTypeRole(role.id)}
                     className={`rounded-full px-4 py-2 transition ${
-                      isActive ? "bg-black/90 text-white shadow" : "text-black/70 hover:bg-black/5"
+                      isActive
+                        ? "bg-black/90 text-white shadow"
+                        : "text-black/70 hover:bg-black/5"
                     }`}
                   >
                     {role.label}
@@ -1477,7 +1529,9 @@ function App() {
             {opTypeStatus === "loading" ? (
               <p className="muted-text text-sm">Loading op types...</p>
             ) : opTypeStatus === "error" ? (
-              <p className="muted-text text-sm">{opTypeError ?? "Failed to load op types."}</p>
+              <p className="muted-text text-sm">
+                {opTypeError ?? "Failed to load op types."}
+              </p>
             ) : opTypeRows.length === 0 ? (
               <p className="muted-text text-sm">No type data available.</p>
             ) : (
@@ -1494,12 +1548,18 @@ function App() {
                   {opTypeRows.map((row, index) => {
                     const total = opTypeTotals[row.eventName];
                     const share =
-                      total && total > 0 ? formatPercent((row.count / total) * 100) : "—";
+                      total && total > 0
+                        ? formatPercent((row.count / total) * 100)
+                        : "—";
                     return (
                       <tr key={`${row.eventName}-${row.typeValue}-${index}`}>
                         <td className="py-1">{row.eventName}</td>
-                        <td className="py-1 font-code">{formatOpTypeValue(row.typeValue)}</td>
-                        <td className="py-1 text-right font-code">{formatNumber(row.count)}</td>
+                        <td className="py-1 font-code">
+                          {formatOpTypeValue(row.typeValue)}
+                        </td>
+                        <td className="py-1 text-right font-code">
+                          {formatNumber(row.count)}
+                        </td>
                         <td className="py-1 text-right font-code">{share}</td>
                       </tr>
                     );
@@ -1513,7 +1573,9 @@ function App() {
         <section className="glass-panel mt-10 rounded-[28px] p-8 fade-in-up">
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div>
-              <p className="muted-text text-xs uppercase tracking-[0.3em]">DFG stats</p>
+              <p className="muted-text text-xs uppercase tracking-[0.3em]">
+                DFG stats
+              </p>
               <h2 className="font-display mt-3 text-2xl">Graph summary</h2>
             </div>
             <p className="muted-text text-xs uppercase tracking-[0.2em]">
@@ -1525,13 +1587,16 @@ function App() {
             </p>
           </div>
           <p className="muted-text mt-3 max-w-2xl text-sm">
-            Snapshot of DFG coverage, sizes, and shape variety for the selected network.
+            Snapshot of DFG coverage, sizes, and shape variety for the selected
+            network.
           </p>
 
           {dfgStatsStatus === "loading" ? (
             <p className="muted-text text-sm">Loading DFG stats...</p>
           ) : dfgStatsStatus === "error" ? (
-            <p className="muted-text text-sm">{dfgStatsError ?? "Failed to load DFG stats."}</p>
+            <p className="muted-text text-sm">
+              {dfgStatsError ?? "Failed to load DFG stats."}
+            </p>
           ) : !dfgStats ? (
             <p className="muted-text text-sm">No DFG stats available.</p>
           ) : (
@@ -1566,7 +1631,9 @@ function App() {
                   key={card.label}
                   className="rounded-2xl border border-black/10 bg-white/70 p-4"
                 >
-                  <p className="muted-text text-[11px] uppercase tracking-[0.3em]">{card.label}</p>
+                  <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
+                    {card.label}
+                  </p>
                   <p className="font-code mt-2 text-lg">{card.value}</p>
                   <p className="muted-text mt-2 text-xs uppercase tracking-[0.18em]">
                     {card.detail}
@@ -1578,7 +1645,9 @@ function App() {
 
           {dfgStats && dfgStatsStatus === "ready" ? (
             <div className="mt-6 rounded-2xl border border-black/10 bg-white/70 p-4">
-              <p className="muted-text text-xs uppercase tracking-[0.3em]">Nodes / edges</p>
+              <p className="muted-text text-xs uppercase tracking-[0.3em]">
+                Nodes / edges
+              </p>
               <div className="mt-3 grid gap-3 md:grid-cols-3">
                 {[
                   {
@@ -1591,8 +1660,13 @@ function App() {
                   {
                     label: "Edges per node",
                     value:
-                      dfgStats.dfg.avgNodes && dfgStats.dfg.avgNodes > 0 && dfgStats.dfg.avgEdges
-                        ? formatDecimal(dfgStats.dfg.avgEdges / dfgStats.dfg.avgNodes, 2)
+                      dfgStats.dfg.avgNodes &&
+                      dfgStats.dfg.avgNodes > 0 &&
+                      dfgStats.dfg.avgEdges
+                        ? formatDecimal(
+                            dfgStats.dfg.avgEdges / dfgStats.dfg.avgNodes,
+                            2,
+                          )
                         : "—",
                     detail: "Avg ratio",
                   },
@@ -1619,500 +1693,303 @@ function App() {
             </div>
           ) : null}
 
+          {/* Rolling Window Dependency Visualization */}
           {dfgStatsStatus === "ready" ? (
             <div className="mt-6 rounded-2xl border border-black/10 bg-white/70 p-4">
-              {/* Header with view mode toggle */}
-              <div className="flex items-center justify-between gap-3 mb-3">
-                <p className="muted-text group relative inline-flex items-center gap-1 text-xs uppercase tracking-[0.3em]">
-                  Tx dependencies
-                  <span className="cursor-help text-black/30 hover:text-black/50">ⓘ</span>
-                  <span className="pointer-events-none absolute left-0 top-full z-10 mt-1 w-72 rounded bg-black/80 px-2 py-1.5 text-[10px] normal-case tracking-normal text-white opacity-0 transition-opacity group-hover:opacity-100">
-                    Dependencies between transactions. "Tx hops" = chain of tx dependencies. "Total
-                    ops" = tx hops + FHE operations within each tx (full critical path).
-                  </span>
-                </p>
+              {/* Header */}
+              <p className="muted-text group relative inline-flex items-center gap-1 text-xs uppercase tracking-[0.3em] mb-4">
+                Rolling window dependencies
+                <span className="cursor-help text-black/30 hover:text-black/50">
+                  ⓘ
+                </span>
+                <span className="pointer-events-none absolute left-0 top-full z-10 mt-1 w-72 rounded bg-black/80 px-2 py-1.5 text-[10px] normal-case tracking-normal text-white opacity-0 transition-opacity group-hover:opacity-100">
+                  Compute dependency depth within a lookback window (N blocks).
+                  Dependencies outside the window are truncated. Matches batch
+                  processing model where only recent blocks matter.
+                </span>
+              </p>
 
-                {/* View mode toggle */}
-                <div className="flex gap-1 rounded-lg bg-black/5 p-1">
-                  <button
-                    type="button"
-                    onClick={() => setDepsViewMode("single")}
-                    className={`rounded px-2 py-1 text-xs transition ${depsViewMode === "single" ? "bg-white shadow" : "hover:bg-white/50"}`}
-                  >
-                    Single range
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setDepsViewMode("chunks")}
-                    className={`rounded px-2 py-1 text-xs transition ${depsViewMode === "chunks" ? "bg-white shadow" : "hover:bg-white/50"}`}
-                  >
-                    Rolling chunks
-                  </button>
-                </div>
-              </div>
-
-              {/* Pattern filter dropdown */}
-              <div className="flex items-center gap-2 mb-3">
-                <label htmlFor="pattern-filter" className="text-xs text-black/60">
-                  Pattern:
-                </label>
-                <select
-                  id="pattern-filter"
-                  value={signatureFilter ?? ""}
-                  onChange={(e) => setSignatureFilter(e.target.value || null)}
-                  className="text-xs border border-black/10 rounded px-2 py-1 bg-white"
-                >
-                  <option value="">All signatures</option>
-                  {signatureOptions.map((sig) => (
-                    <option key={sig.signatureHash} value={sig.signatureHash}>
-                      {shortenHandle(sig.signatureHash, 8, 4)} ({sig.txCount} txs)
-                    </option>
+              {/* Window selector */}
+              <div className="flex flex-wrap items-center gap-3 mb-4">
+                <span className="text-xs text-black/60">Lookback window:</span>
+                <div className="flex gap-1 rounded-lg bg-black/5 p-0.5">
+                  {[1, 3, 5, 10, 20, 50, 100, 200].map((size) => (
+                    <button
+                      key={size}
+                      type="button"
+                      onClick={() => setWindowLookback(size)}
+                      className={`rounded px-3 py-1 text-[11px] transition ${windowLookback === size ? "bg-white shadow" : "hover:bg-white/50"}`}
+                    >
+                      {size}
+                    </button>
                   ))}
-                </select>
-                {signatureOptionsStatus === "loading" && (
-                  <span className="text-xs text-black/40">Loading...</span>
+                </div>
+                {windowStatus === "loading" && (
+                  <span className="text-xs text-black/50">Computing...</span>
+                )}
+                {windowStatus === "error" && (
+                  <span className="text-xs text-red-600">
+                    {windowError ?? "Failed to load."}
+                  </span>
                 )}
               </div>
 
-              {/* Single range view */}
-              {depsViewMode === "single" ? (
+              {/* Window stats summary */}
+              {windowStats && windowStatus === "ready" && (
                 <>
-                  <div className="flex flex-wrap items-center gap-3">
-                    {/* Horizon filter */}
-                    <div className="flex items-center gap-2">
-                      <span className="muted-text text-xs">Horizon:</span>
-                      <select
-                        value={horizonMode}
-                        onChange={(e) =>
-                          setHorizonMode(e.target.value as "all" | "block" | "range")
-                        }
-                        className="rounded border border-black/10 bg-white px-2 py-1 text-xs"
-                      >
-                        <option value="all">All time</option>
-                        <option value="block">Latest block</option>
-                        <option value="range">Last N blocks</option>
-                      </select>
-                      {horizonMode === "range" && (
-                        <input
-                          type="number"
-                          value={horizonBlocks}
-                          onChange={(e) =>
-                            setHorizonBlocks(
-                              Math.max(1, Math.min(10000, Number(e.target.value) || 1)),
-                            )
-                          }
-                          min={1}
-                          max={10000}
-                          className="w-20 rounded border border-black/10 bg-white px-2 py-1 text-xs"
-                        />
-                      )}
+                  <div className="rounded-xl border border-black/5 bg-teal-50/50 p-4 mb-4">
+                    <p className="text-xs text-black/60 mb-3">
+                      Depth stats for {windowStats.lookbackBlocks}-block window
+                      ({formatNumber(windowStats.stats.totalTxs)} txs)
+                    </p>
+                    <div className="grid gap-4 md:grid-cols-5">
+                      <div>
+                        <p className="muted-text text-[10px] uppercase tracking-[0.2em]">
+                          Max combined
+                        </p>
+                        <p className="font-code text-xl mt-1">
+                          {formatNumber(windowStats.stats.maxCombinedDepth)}
+                        </p>
+                        <p className="text-[10px] text-black/50">
+                          inter + intra
+                        </p>
+                      </div>
+                      <div>
+                        <p className="muted-text text-[10px] uppercase tracking-[0.2em]">
+                          Avg combined
+                        </p>
+                        <p className="font-code text-xl mt-1">
+                          {formatDecimal(windowStats.stats.avgCombinedDepth, 1)}
+                        </p>
+                        <p className="text-[10px] text-black/50">
+                          {formatDecimal(
+                            windowStats.stats.avgTruncatedDepth,
+                            1,
+                          )}{" "}
+                          + {formatDecimal(windowStats.stats.avgIntraDepth, 1)}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="muted-text text-[10px] uppercase tracking-[0.2em]">
+                          Max inter-tx
+                        </p>
+                        <p className="font-code text-xl mt-1">
+                          {formatNumber(windowStats.stats.maxTruncatedDepth)}
+                        </p>
+                        <p className="text-[10px] text-black/50">
+                          cross-tx deps
+                        </p>
+                      </div>
+                      <div>
+                        <p className="muted-text text-[10px] uppercase tracking-[0.2em]">
+                          Parallelism
+                        </p>
+                        <p className="font-code text-xl mt-1">
+                          {formatPercent(
+                            windowStats.stats.parallelismRatio * 100,
+                          )}
+                        </p>
+                        <p className="text-[10px] text-black/50">
+                          {formatNumber(windowStats.stats.independentTxs)} /{" "}
+                          {formatNumber(windowStats.stats.totalTxs)}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="muted-text text-[10px] uppercase tracking-[0.2em]">
+                          Dependent txs
+                        </p>
+                        <p className="font-code text-xl mt-1">
+                          {formatNumber(windowStats.stats.dependentTxs)}
+                        </p>
+                        <p className="text-[10px] text-black/50">
+                          {formatPercent(
+                            (windowStats.stats.dependentTxs /
+                              Math.max(windowStats.stats.totalTxs, 1)) *
+                              100,
+                          )}
+                        </p>
+                      </div>
                     </div>
-                    {/* Depth mode toggle */}
-                    <div className="flex gap-1 rounded-lg bg-black/5 p-1">
-                      <button
-                        type="button"
-                        onClick={() => setDepthMode("inter")}
-                        className={`rounded px-3 py-1 text-xs transition ${depthMode === "inter" ? "bg-white shadow" : "hover:bg-white/50"}`}
-                      >
-                        Tx hops
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setDepthMode("total")}
-                        className={`rounded px-3 py-1 text-xs transition ${depthMode === "total" ? "bg-white shadow" : "hover:bg-white/50"}`}
-                      >
-                        Total ops
-                      </button>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={loadDfgDeps}
-                      disabled={dfgDepsStatus === "loading"}
-                      className="rounded-full border border-black/10 bg-white px-4 py-2 text-xs uppercase tracking-[0.2em] text-black/70 transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {dfgDepsStatus === "loading"
-                        ? "Loading..."
-                        : dfgDeps
-                          ? "Refresh"
-                          : "Load stats"}
-                    </button>
-                    {dfgDepsStatus === "error" ? (
-                      <span className="text-xs text-red-600">
-                        {dfgDepsError ?? "Failed to load."}
-                      </span>
-                    ) : null}
                   </div>
-                  {dfgDeps?.horizon && (
-                    <p className="muted-text mt-2 text-xs">
-                      Showing blocks {formatNumber(dfgDeps.horizon.startBlock)} -{" "}
-                      {formatNumber(dfgDeps.horizon.endBlock)} (
-                      {formatNumber(dfgDeps.horizon.blockCount)} block
-                      {dfgDeps.horizon.blockCount !== 1 ? "s" : ""})
-                    </p>
-                  )}
-                  {dfgDeps ? (
-                    <>
-                      {/* Side-by-side depth comparison */}
-                      <div className="mt-4 grid gap-3 md:grid-cols-2">
-                        <div className="rounded-2xl border border-black/5 bg-white/70 p-4">
-                          <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
-                            Max chain depth
-                          </p>
-                          <p className="font-code mt-2 text-3xl">
-                            {formatNumber(dfgDeps.maxChainDepth)}
-                          </p>
-                          <p className="muted-text mt-2 text-xs">Tx hops only</p>
-                        </div>
-                        <div className="rounded-2xl border border-black/5 bg-white/70 p-4">
-                          <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
-                            Max total depth
-                          </p>
-                          <p className="font-code mt-2 text-3xl">
-                            {formatNumber(dfgDeps.maxTotalDepth)}
-                          </p>
-                          <p className="muted-text mt-2 text-xs">
-                            Full critical path (tx hops + all FHE ops)
-                          </p>
-                        </div>
-                      </div>
-                      <div className="mt-4 grid gap-3 md:grid-cols-3">
-                        {[
-                          {
-                            label: "Parallelism",
-                            value: formatPercent(dfgDeps.parallelismRatio * 100),
-                            detail: "Independent / total txs",
-                          },
-                          {
-                            label: "Independent txs",
-                            value: formatNumber(dfgDeps.independentTxs),
-                            detail: "Chain depth = 0",
-                          },
-                          {
-                            label: "Total txs",
-                            value: formatNumber(dfgDeps.totalTxs),
-                            detail: "With dependency data",
-                          },
-                        ].map((card) => (
-                          <div
-                            key={card.label}
-                            className="rounded-2xl border border-black/5 bg-white/70 p-4"
-                          >
-                            <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
-                              {card.label}
-                            </p>
-                            <p className="font-code mt-2 text-lg">{card.value}</p>
-                            <p className="muted-text mt-2 text-xs uppercase tracking-[0.18em]">
-                              {card.detail}
-                            </p>
-                          </div>
-                        ))}
-                      </div>
-                      <div className="mt-4 grid gap-3 md:grid-cols-3">
-                        {[
-                          {
-                            label: "Dependent txs",
-                            value: formatNumber(dfgDeps.dependentTxs),
-                            detail:
-                              dfgDeps.totalTxs > 0
-                                ? `${formatPercent(
-                                    (dfgDeps.dependentTxs / dfgDeps.totalTxs) * 100,
-                                  )} of DFG txs`
-                                : "—",
-                          },
-                          {
-                            label: "Avg upstream txs",
-                            value: formatDecimal(dfgDeps.avgUpstreamTxs, 2),
-                            detail: "Per dependent tx",
-                          },
-                          {
-                            label: "Avg upstream handles",
-                            value: formatDecimal(dfgDeps.avgUpstreamHandles, 2),
-                            detail: "Per dependent tx",
-                          },
-                        ].map((card) => (
-                          <div
-                            key={card.label}
-                            className="rounded-2xl border border-black/5 bg-white/70 p-4"
-                          >
-                            <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
-                              {card.label}
-                            </p>
-                            <p className="font-code mt-2 text-lg">{card.value}</p>
-                            <p className="muted-text mt-2 text-xs uppercase tracking-[0.18em]">
-                              {card.detail}
-                            </p>
-                          </div>
-                        ))}
-                      </div>
-                      {(() => {
-                        const activeDistribution =
-                          depthMode === "total"
-                            ? dfgDeps.totalDepthDistribution
-                            : dfgDeps.chainDepthDistribution;
-                        const distributionLabel =
-                          depthMode === "total"
-                            ? "Total depth distribution"
-                            : "Chain depth distribution";
-                        const distributionFooter =
-                          depthMode === "total"
-                            ? "Total depth = tx hops + internal FHE ops (full critical path)"
-                            : "Chain depth = upstream tx hops, not internal FHE ops";
-                        if (!activeDistribution || Object.keys(activeDistribution).length === 0) {
-                          return null;
-                        }
-                        return (
-                          <div className="mt-4 rounded-2xl border border-black/5 bg-white/70 p-4">
-                            <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
-                              {distributionLabel}
-                            </p>
-                            <div className="mt-3 flex">
-                              {(() => {
-                                // Bucket the distribution for readability
-                                const raw = activeDistribution;
-                                const BAR_MAX_HEIGHT = 80; // pixels
 
-                                // Find max depth to determine bucket ranges
-                                const allDepths = Object.keys(raw).map(Number);
-                                const maxDepth = Math.max(...allDepths, 0);
-
-                                // Build buckets dynamically based on max depth
-                                type BucketDef = [number, number, string];
-                                const bucketDefs: BucketDef[] = [];
-
-                                if (maxDepth <= 20) {
-                                  // Small range: show individual values
-                                  for (let i = 0; i <= maxDepth; i++) {
-                                    bucketDefs.push([i, i, String(i)]);
-                                  }
-                                } else if (maxDepth <= 100) {
-                                  // Medium range
-                                  bucketDefs.push([0, 0, "0"]);
-                                  bucketDefs.push([1, 5, "1-5"]);
-                                  bucketDefs.push([6, 10, "6-10"]);
-                                  bucketDefs.push([11, 20, "11-20"]);
-                                  bucketDefs.push([21, 50, "21-50"]);
-                                  bucketDefs.push([51, maxDepth, "51+"]);
-                                } else if (maxDepth <= 1000) {
-                                  // Large range
-                                  bucketDefs.push([0, 0, "0"]);
-                                  bucketDefs.push([1, 10, "1-10"]);
-                                  bucketDefs.push([11, 50, "11-50"]);
-                                  bucketDefs.push([51, 100, "51-100"]);
-                                  if (maxDepth <= 500) {
-                                    bucketDefs.push([101, maxDepth, `101-${maxDepth}`]);
-                                  } else {
-                                    bucketDefs.push([101, 500, "101-500"]);
-                                    bucketDefs.push([501, maxDepth, `501-${maxDepth}`]);
-                                  }
-                                } else {
-                                  // Very large range (1000+)
-                                  bucketDefs.push([0, 0, "0"]);
-                                  bucketDefs.push([1, 10, "1-10"]);
-                                  bucketDefs.push([11, 100, "11-100"]);
-                                  bucketDefs.push([101, 500, "101-500"]);
-                                  if (maxDepth <= 1000) {
-                                    bucketDefs.push([501, maxDepth, `501-${maxDepth}`]);
-                                  } else if (maxDepth <= 2000) {
-                                    bucketDefs.push([501, 1000, "501-1k"]);
-                                    bucketDefs.push([1001, maxDepth, `1k-${maxDepth}`]);
-                                  } else {
-                                    bucketDefs.push([501, 1000, "501-1k"]);
-                                    bucketDefs.push([1001, 2000, "1k-2k"]);
-                                    bucketDefs.push([2001, maxDepth, `2k-${maxDepth}`]);
-                                  }
-                                }
-
-                                const buckets: Array<{
-                                  label: string;
-                                  count: number;
-                                  tooltip: string;
-                                }> = [];
-
-                                for (const [min, max, label] of bucketDefs) {
-                                  let count = 0;
-                                  for (const [k, v] of Object.entries(raw)) {
-                                    const depth = Number(k);
-                                    if (depth >= min && depth <= max) {
-                                      count += v;
-                                    }
-                                  }
-                                  if (count > 0 || min === 0) {
-                                    const tooltip =
-                                      min === max
-                                        ? `Depth ${min}: ${formatNumber(count)} txs`
-                                        : `Depths ${min}-${Math.min(max, maxDepth)}: ${formatNumber(count)} txs`;
-                                    buckets.push({ label, count, tooltip });
-                                  }
-                                }
-
-                                const maxCount = Math.max(...buckets.map((b) => b.count), 1);
-
-                                // Format Y-axis labels (compact numbers)
-                                const formatYLabel = (n: number): string => {
-                                  if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
-                                  if (n >= 1000) return `${(n / 1000).toFixed(0)}k`;
-                                  return String(n);
-                                };
-
-                                return (
-                                  <>
-                                    {/* Y-axis */}
-                                    <div
-                                      className="flex flex-col justify-between pr-2 text-right"
-                                      style={{ height: `${BAR_MAX_HEIGHT + 16}px` }}
-                                    >
-                                      <span className="font-code text-[9px] text-black/40">
-                                        {formatYLabel(maxCount)}
-                                      </span>
-                                      <span className="font-code text-[9px] text-black/40">
-                                        {formatYLabel(Math.round(maxCount / 2))}
-                                      </span>
-                                      <span className="font-code text-[9px] text-black/40">0</span>
-                                    </div>
-                                    {/* Bars */}
-                                    <div className="flex flex-1 items-end gap-2">
-                                      {buckets.map((bucket) => (
-                                        <div
-                                          key={bucket.label}
-                                          className="group relative flex min-w-[36px] flex-1 flex-col items-center"
-                                        >
-                                          {/* Instant tooltip */}
-                                          <div className="pointer-events-none absolute bottom-full left-1/2 z-10 mb-1 -translate-x-1/2 whitespace-nowrap rounded bg-black/80 px-2 py-1 text-[10px] text-white opacity-0 transition-opacity group-hover:opacity-100">
-                                            {bucket.tooltip}
-                                          </div>
-                                          <div
-                                            className="w-full rounded-t bg-black/20 transition-all hover:bg-black/40"
-                                            style={{
-                                              height: `${Math.max((bucket.count / maxCount) * BAR_MAX_HEIGHT, 4)}px`,
-                                            }}
-                                          />
-                                          <span className="font-code mt-1 text-[9px] text-black/50">
-                                            {bucket.label}
-                                          </span>
-                                        </div>
-                                      ))}
-                                    </div>
-                                  </>
-                                );
-                              })()}
-                            </div>
-                            <p className="muted-text mt-2 text-center text-[10px]">
-                              {distributionFooter}
-                            </p>
-                          </div>
-                        );
-                      })()}
-                      <p className="muted-text mt-3 text-xs">
-                        Chain depth excludes trivial encrypts. Parallelism ratio = independent txs /
-                        total txs.
+                  {/* Combined depth distribution histogram */}
+                  <div className="rounded-xl border border-black/5 bg-white p-4 mb-4">
+                    <div className="flex items-center justify-between mb-3">
+                      <p className="muted-text text-[10px] uppercase tracking-[0.2em]">
+                        Combined depth distribution
                       </p>
-                    </>
-                  ) : (
-                    <p className="muted-text mt-3 text-xs">
-                      Load on demand to avoid blocking the API while computing dependencies.
-                    </p>
-                  )}
-                </>
-              ) : (
-                /* Rolling chunks view */
-                <>
-                  <div className="flex items-center gap-2 mb-3">
-                    <label htmlFor="chunk-size" className="text-xs text-black/60">
-                      Chunk size:
-                    </label>
-                    <select
-                      id="chunk-size"
-                      value={chunkSize}
-                      onChange={(e) => setChunkSize(Number(e.target.value))}
-                      className="text-xs border border-black/10 rounded px-2 py-1 bg-white"
-                    >
-                      <option value={10}>10 blocks</option>
-                      <option value={50}>50 blocks</option>
-                      <option value={100}>100 blocks</option>
-                      <option value={500}>500 blocks</option>
-                      <option value={1000}>1000 blocks</option>
-                    </select>
-                    <button
-                      type="button"
-                      onClick={loadChunks}
-                      disabled={chunksStatus === "loading"}
-                      className="text-xs px-3 py-1 bg-teal-600 text-white rounded hover:bg-teal-700 disabled:opacity-60"
-                    >
-                      {chunksStatus === "loading" ? "Loading..." : "Load"}
-                    </button>
-                    {chunksStatus === "error" && (
-                      <span className="text-xs text-red-600">
-                        {chunksError ?? "Failed to load."}
-                      </span>
+                      <div className="flex items-center gap-3 text-[9px]">
+                        <span className="flex items-center gap-1">
+                          <span className="w-2 h-2 rounded-sm bg-teal-600" />
+                          Inter-tx
+                        </span>
+                        <span className="flex items-center gap-1">
+                          <span className="w-2 h-2 rounded-sm bg-teal-300" />
+                          Intra-tx
+                        </span>
+                      </div>
+                    </div>
+                    {Object.keys(windowStats.stats.combinedDepthDistribution)
+                      .length === 0 ? (
+                      <p className="muted-text text-sm">
+                        No depth distribution data. All transactions may be
+                        independent (depth 0).
+                      </p>
+                    ) : (
+                      <div className="flex gap-2">
+                        {/* Y axis */}
+                        {(() => {
+                          const dist =
+                            windowStats.stats.combinedDepthDistribution;
+                          const maxCount = Math.max(
+                            ...Object.values(dist).map((d) => d.count),
+                          );
+                          return (
+                            <div
+                              className="flex flex-col justify-between text-[9px] text-black/50 text-right pr-1"
+                              style={{ height: 80 }}
+                            >
+                              <span>{formatNumber(maxCount)}</span>
+                              <span>
+                                {formatNumber(Math.round(maxCount / 2))}
+                              </span>
+                              <span>0</span>
+                            </div>
+                          );
+                        })()}
+                        {/* Stacked bars */}
+                        <div className="flex-1 flex items-end gap-px">
+                          {(() => {
+                            const dist =
+                              windowStats.stats.combinedDepthDistribution;
+                            const maxDepth = Math.max(
+                              ...Object.keys(dist).map(Number),
+                            );
+                            const maxCount = Math.max(
+                              ...Object.values(dist).map((d) => d.count),
+                            );
+                            const bars = [];
+                            for (let d = 0; d <= Math.min(maxDepth, 20); d++) {
+                              const bucket = dist[d];
+                              const count = bucket?.count ?? 0;
+                              const avgIntra = bucket?.avgIntra ?? 0;
+                              const totalHeightPx =
+                                maxCount > 0
+                                  ? Math.max((count / maxCount) * 80, 2)
+                                  : 2;
+                              // Split bar proportionally
+                              const intraPortion = d > 0 ? avgIntra / d : 0;
+                              const intraHeightPx =
+                                totalHeightPx * intraPortion;
+                              const interHeightPx =
+                                totalHeightPx - intraHeightPx;
+                              bars.push(
+                                <div
+                                  key={d}
+                                  className="flex-1 flex flex-col items-center justify-end"
+                                >
+                                  <div className="w-full min-w-[4px] flex flex-col justify-end">
+                                    {/* Intra-tx (top, lighter) */}
+                                    {intraHeightPx > 0 && (
+                                      <div
+                                        className="w-full bg-teal-300 rounded-t"
+                                        style={{ height: intraHeightPx }}
+                                      />
+                                    )}
+                                    {/* Inter-tx (bottom, darker) */}
+                                    {interHeightPx > 0 && (
+                                      <div
+                                        className={`w-full bg-teal-600 ${intraHeightPx === 0 ? "rounded-t" : ""}`}
+                                        style={{ height: interHeightPx }}
+                                      />
+                                    )}
+                                  </div>
+                                  <span className="text-[9px] text-black/50 mt-1">
+                                    {d}
+                                  </span>
+                                </div>,
+                              );
+                            }
+                            if (maxDepth > 20) {
+                              bars.push(
+                                <div
+                                  key="overflow"
+                                  className="flex-1 flex flex-col items-center justify-end"
+                                >
+                                  <span className="text-[9px] text-black/30">
+                                    ...
+                                  </span>
+                                  <span className="text-[9px] text-black/50 mt-1">
+                                    {maxDepth}
+                                  </span>
+                                </div>,
+                              );
+                            }
+                            return bars;
+                          })()}
+                        </div>
+                      </div>
                     )}
                   </div>
 
-                  {chunksData.length > 0 ? (
-                    <>
-                      {/* Chunks table */}
-                      <div className="overflow-x-auto">
-                        <table className="w-full text-xs">
-                          <thead>
-                            <tr className="text-left border-b text-black/60">
-                              <th className="py-2 pr-3">Blocks</th>
-                              <th className="py-2 pr-3 text-right">Txs</th>
-                              <th className="py-2 pr-3 text-right">Parallel %</th>
-                              <th className="py-2 pr-3 text-right">Max depth</th>
-                              <th className="py-2 pr-3 text-right">Avg depth</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {chunksData.map((chunk) => (
-                              <tr key={chunk.startBlock} className="border-b border-black/5">
-                                <td className="py-2 pr-3 font-mono">
-                                  {formatNumber(chunk.startBlock)}–{formatNumber(chunk.endBlock)}
-                                </td>
-                                <td className="py-2 pr-3 text-right">
-                                  {formatNumber(chunk.totalTxs)}
-                                </td>
-                                <td className="py-2 pr-3 text-right">
-                                  {formatPercent(chunk.parallelismRatio * 100)}
-                                </td>
-                                <td className="py-2 pr-3 text-right">{chunk.maxChainDepth}</td>
-                                <td className="py-2 pr-3 text-right">
-                                  {formatDecimal(chunk.avgChainDepth)}
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-
-                      {/* Parallelism bar chart */}
-                      <div className="mt-4">
-                        <p className="muted-text text-[10px] uppercase tracking-[0.2em] mb-2">
-                          Parallelism over time
+                  {/* Top depth transactions */}
+                  {windowStats.topDepthTxs.length > 0 && (
+                    <div className="rounded-xl border border-black/5 bg-white p-4">
+                      <div className="flex items-center justify-between mb-3">
+                        <p className="muted-text text-[10px] uppercase tracking-[0.2em]">
+                          Top depth transactions
                         </p>
-                        <div className="h-24 flex items-end gap-1">
-                          {chunksData
-                            .slice()
-                            .reverse()
-                            .map((chunk) => (
-                              <div
-                                key={chunk.startBlock}
-                                className="group relative bg-teal-600 flex-1 rounded-t min-w-[4px] hover:bg-teal-500 transition-colors"
-                                style={{ height: `${Math.max(chunk.parallelismRatio * 100, 2)}%` }}
-                              >
-                                <div className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-1 z-10 whitespace-nowrap rounded bg-black/80 px-2 py-1 text-[10px] text-white opacity-0 transition-opacity group-hover:opacity-100">
-                                  {formatNumber(chunk.startBlock)}:{" "}
-                                  {formatPercent(chunk.parallelismRatio * 100)}
-                                </div>
-                              </div>
-                            ))}
-                        </div>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDfgLookback(windowStats.lookbackBlocks);
+                            dfgViewerRef.current?.scrollIntoView({
+                              behavior: "smooth",
+                              block: "start",
+                            });
+                          }}
+                          className="text-[10px] px-2 py-0.5 border border-teal-600 text-teal-600 rounded hover:bg-teal-50"
+                        >
+                          Enable cut edges in viewer
+                        </button>
                       </div>
-                    </>
-                  ) : chunksStatus === "ready" ? (
-                    <p className="muted-text text-xs">No chunks data available.</p>
-                  ) : (
-                    <p className="muted-text text-xs">
-                      Click "Load" to fetch rolling chunk statistics.
-                    </p>
+                      <div className="space-y-1">
+                        {windowStats.topDepthTxs.map((tx) => (
+                          <div
+                            key={tx.txHash}
+                            className="flex items-center justify-between text-xs bg-black/[0.02] rounded px-2 py-1.5"
+                          >
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setDfgSelection(tx.txHash);
+                                setDfgQuery(tx.txHash);
+                                setDfgLookback(windowStats.lookbackBlocks);
+                                dfgViewerRef.current?.scrollIntoView({
+                                  behavior: "smooth",
+                                  block: "start",
+                                });
+                              }}
+                              className="font-mono text-teal-700 hover:underline text-left"
+                            >
+                              {shortenHandle(tx.txHash, 10, 6)}
+                            </button>
+                            <div className="flex items-center gap-4 text-black/50">
+                              <span>block {formatNumber(tx.blockNumber)}</span>
+                              <span className="font-mono">
+                                combined:{" "}
+                                <span className="text-teal-700">
+                                  {tx.combinedDepth}
+                                </span>
+                                <span className="text-[10px] text-black/40 ml-1">
+                                  ({tx.truncatedDepth}+{tx.intraTxDepth})
+                                </span>
+                              </span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
                   )}
                 </>
               )}
@@ -2123,7 +2000,9 @@ function App() {
         <section className="glass-panel mt-10 rounded-[28px] p-8 fade-in-up">
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div>
-              <p className="muted-text text-xs uppercase tracking-[0.3em]">DFG rollup</p>
+              <p className="muted-text text-xs uppercase tracking-[0.3em]">
+                DFG rollup
+              </p>
               <h2 className="font-display mt-3 text-2xl">Aggregate usage</h2>
             </div>
             <p className="muted-text text-xs uppercase tracking-[0.2em]">
@@ -2137,20 +2016,33 @@ function App() {
             </p>
           </div>
           <p className="muted-text mt-3 max-w-2xl text-sm">
-            Summed across all DFGs. Run `bun run dfg:rollup` after rebuilding graphs.
+            Summed across all DFGs. Run `bun run dfg:rollup` after rebuilding
+            graphs.
           </p>
 
           {dfgRollupStatus === "loading" ? (
             <p className="muted-text text-sm">Loading DFG rollup...</p>
           ) : dfgRollupStatus === "error" ? (
-            <p className="muted-text text-sm">{dfgRollupError ?? "Failed to load DFG rollup."}</p>
+            <p className="muted-text text-sm">
+              {dfgRollupError ?? "Failed to load DFG rollup."}
+            </p>
           ) : !dfgRollupStats ? (
             <p className="muted-text text-sm">No rollup data yet.</p>
           ) : (
             <div className="mt-6 grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
               <div className="rounded-2xl border border-black/10 bg-white/70 p-4">
                 <div className="flex items-center justify-between gap-4">
-                  <p className="muted-text text-xs uppercase tracking-[0.3em]">Top ops</p>
+                  <p className="muted-text group relative inline-flex items-center gap-1 text-xs uppercase tracking-[0.3em]">
+                    Top ops
+                    <span className="cursor-help text-black/30 hover:text-black/50">
+                      ⓘ
+                    </span>
+                    <span className="pointer-events-none absolute left-0 top-full z-10 mt-1 w-64 rounded bg-black/80 px-2 py-1.5 text-[10px] normal-case tracking-normal text-white opacity-0 transition-opacity group-hover:opacity-100">
+                      FHE operations from reconstructed DFG graphs. Similar to
+                      "Top events" but only counts ops that are part of
+                      transaction dataflow graphs.
+                    </span>
+                  </p>
                   <span className="font-code text-xs">
                     {formatNumber(dfgRollupTotalNodes)} nodes
                   </span>
@@ -2162,7 +2054,10 @@ function App() {
                         ? formatPercent((row.count / dfgRollupTotalNodes) * 100)
                         : "—";
                     return (
-                      <div key={row.op} className="flex items-center justify-between text-sm">
+                      <div
+                        key={row.op}
+                        className="flex items-center justify-between text-sm"
+                      >
                         <span>{row.op}</span>
                         <span className="font-code text-xs">
                           {formatNumber(row.count)} · {share}
@@ -2175,32 +2070,75 @@ function App() {
 
               <div className="grid gap-4">
                 <div className="rounded-2xl border border-black/10 bg-white/70 p-4">
-                  <p className="muted-text text-xs uppercase tracking-[0.3em]">Input kinds</p>
+                  <p className="muted-text group relative inline-flex items-center gap-1 text-xs uppercase tracking-[0.3em]">
+                    Input kinds
+                    <span className="cursor-help text-black/30 hover:text-black/50">
+                      ⓘ
+                    </span>
+                    <span className="pointer-events-none absolute left-0 top-full z-10 mt-1 w-72 rounded bg-black/80 px-2 py-1.5 text-[10px] normal-case tracking-normal text-white opacity-0 transition-opacity group-hover:opacity-100">
+                      <b>Ciphertext</b>: handle from same tx (internal).
+                      <br />
+                      <b>Trivial</b>: trivial encryption of a constant.
+                      <br />
+                      <b>External</b>: handle from different tx (cross-tx dep).
+                      <br />
+                      <b>Scalar</b>: plaintext value, not encrypted.
+                    </span>
+                  </p>
                   <div className="mt-3 space-y-2 text-sm">
                     {[
-                      { label: "Ciphertext", value: dfgRollupInputTotals.ciphertext },
+                      {
+                        label: "Ciphertext",
+                        value: dfgRollupInputTotals.ciphertext,
+                      },
                       { label: "Trivial", value: dfgRollupInputTotals.trivial },
-                      { label: "External", value: dfgRollupInputTotals.external },
+                      {
+                        label: "External",
+                        value: dfgRollupInputTotals.external,
+                      },
                       { label: "Scalar", value: dfgRollupInputTotals.scalar },
                     ].map((row) => (
-                      <div key={row.label} className="flex items-center justify-between">
+                      <div
+                        key={row.label}
+                        className="flex items-center justify-between"
+                      >
                         <span>{row.label}</span>
-                        <span className="font-code text-xs">{formatNumber(row.value)}</span>
+                        <span className="font-code text-xs">
+                          {formatNumber(row.value)}
+                        </span>
                       </div>
                     ))}
                   </div>
                 </div>
 
                 <div className="rounded-2xl border border-black/10 bg-white/70 p-4">
-                  <p className="muted-text text-xs uppercase tracking-[0.3em]">Operand pairs</p>
+                  <p className="muted-text group relative inline-flex items-center gap-1 text-xs uppercase tracking-[0.3em]">
+                    Operand pairs
+                    <span className="cursor-help text-black/30 hover:text-black/50">
+                      ⓘ
+                    </span>
+                    <span className="pointer-events-none absolute left-0 top-full z-10 mt-1 w-72 rounded bg-black/80 px-2 py-1.5 text-[10px] normal-case tracking-normal text-white opacity-0 transition-opacity group-hover:opacity-100">
+                      For binary ops (add, mul, etc.), shows LHS × RHS input
+                      kind combinations. E.g., "ciphertext + scalar" = encrypted
+                      LHS with plaintext RHS. Scalar ops are cheaper than
+                      ciphertext × ciphertext.
+                    </span>
+                  </p>
                   <div className="mt-3 space-y-2 text-sm">
                     {dfgRollupOperandPairs.length === 0 ? (
-                      <p className="muted-text text-sm">No operand pairs recorded.</p>
+                      <p className="muted-text text-sm">
+                        No operand pairs recorded.
+                      </p>
                     ) : (
                       dfgRollupOperandPairs.map((row) => (
-                        <div key={row.pair} className="flex items-center justify-between">
+                        <div
+                          key={row.pair}
+                          className="flex items-center justify-between"
+                        >
                           <span>{row.pair}</span>
-                          <span className="font-code text-xs">{formatNumber(row.count)}</span>
+                          <span className="font-code text-xs">
+                            {formatNumber(row.count)}
+                          </span>
                         </div>
                       ))
                     )}
@@ -2214,7 +2152,9 @@ function App() {
         <section className="glass-panel mt-10 rounded-[28px] p-8 fade-in-up">
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div>
-              <p className="muted-text text-xs uppercase tracking-[0.3em]">Signatures</p>
+              <p className="muted-text text-xs uppercase tracking-[0.3em]">
+                Signatures
+              </p>
               <h2 className="font-display mt-3 text-2xl">Top DFG patterns</h2>
             </div>
             <div className="flex flex-wrap items-center gap-3">
@@ -2235,7 +2175,9 @@ function App() {
                   value={dfgSignatureMinNodes}
                   onChange={(event) => {
                     const next = Number(event.target.value);
-                    setDfgSignatureMinNodes(Number.isFinite(next) ? Math.max(0, next) : 0);
+                    setDfgSignatureMinNodes(
+                      Number.isFinite(next) ? Math.max(0, next) : 0,
+                    );
                   }}
                   className="w-14 rounded-full border border-black/10 bg-white px-2 py-1 text-center text-[10px] uppercase tracking-[0.2em]"
                 />
@@ -2246,7 +2188,9 @@ function App() {
                   value={dfgSignatureMinEdges}
                   onChange={(event) => {
                     const next = Number(event.target.value);
-                    setDfgSignatureMinEdges(Number.isFinite(next) ? Math.max(0, next) : 0);
+                    setDfgSignatureMinEdges(
+                      Number.isFinite(next) ? Math.max(0, next) : 0,
+                    );
                   }}
                   className="w-14 rounded-full border border-black/10 bg-white px-2 py-1 text-center text-[10px] uppercase tracking-[0.2em]"
                 />
@@ -2254,8 +2198,8 @@ function App() {
             </div>
           </div>
           <p className="muted-text mt-3 max-w-2xl text-sm">
-            Signatures hash the ordered ops + edges so repeated graph structures can be counted
-            without heavy mining.
+            Signatures hash the ordered ops + edges so repeated graph structures
+            can be counted without heavy mining.
           </p>
 
           <div className="mt-6 max-h-[360px] overflow-auto rounded-2xl border border-black/10 bg-white/70 p-4">
@@ -2282,7 +2226,9 @@ function App() {
                   {dfgSignatures.map((row, index) => {
                     const baseTotal = dfgStats?.dfg.total ?? dfgTotal;
                     const share =
-                      baseTotal > 0 ? formatPercent((row.txCount / baseTotal) * 100) : "—";
+                      baseTotal > 0
+                        ? formatPercent((row.txCount / baseTotal) * 100)
+                        : "—";
                     return (
                       <tr
                         key={`${row.signatureHash}-${index}`}
@@ -2291,7 +2237,6 @@ function App() {
                         onClick={() => {
                           setDfgSignatureSelection(row.signatureHash);
                           setDfgSelection(null);
-                          setDfgGraphView(true);
                           dfgViewerRef.current?.scrollIntoView({
                             behavior: "smooth",
                             block: "start",
@@ -2306,7 +2251,9 @@ function App() {
                             </span>
                           </span>
                         </td>
-                        <td className="py-1 text-right font-code">{formatNumber(row.txCount)}</td>
+                        <td className="py-1 text-right font-code">
+                          {formatNumber(row.txCount)}
+                        </td>
                         <td className="py-1 text-right font-code">{share}</td>
                         <td className="py-1 text-right font-code">
                           {formatNumber(Math.round(row.avgNodes))}
@@ -2323,389 +2270,273 @@ function App() {
           </div>
         </section>
 
-        <section ref={dfgViewerRef} className="glass-panel mt-10 rounded-[28px] p-8 fade-in-up">
+        <section
+          ref={dfgViewerRef}
+          className="glass-panel mt-10 rounded-[28px] p-8 fade-in-up"
+        >
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div>
-              <p className="muted-text text-xs uppercase tracking-[0.3em]">DFG viewer</p>
+              <p className="muted-text text-xs uppercase tracking-[0.3em]">
+                DFG viewer
+              </p>
               <h2 className="font-display mt-3 text-2xl">Tx dataflow graphs</h2>
             </div>
             <div className="flex flex-wrap items-center gap-3">
               <p className="muted-text text-xs uppercase tracking-[0.2em]">
-                Showing {formatNumber(dfgTxs.length)} of {formatNumber(dfgTotal)} ·{" "}
-                {dfgStatus === "loading" ? "Loading" : dfgStatus === "error" ? "Error" : "Ready"}
+                Showing {formatNumber(dfgTxs.length)} of{" "}
+                {formatNumber(dfgTotal)} ·{" "}
+                {dfgStatus === "loading"
+                  ? "Loading"
+                  : dfgStatus === "error"
+                    ? "Error"
+                    : "Ready"}
               </p>
-              <button
-                type="button"
-                onClick={() => setDfgGraphView((value) => !value)}
-                disabled={!dfgSelected}
-                className="rounded-full border border-black/10 bg-white px-4 py-2 text-[10px] uppercase tracking-[0.2em] text-black/70 transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                Graph {dfgGraphView ? "On" : "Off"}
-              </button>
+              {dfgLookback !== null && (
+                <div className="flex items-center gap-2 rounded-full border border-violet-200 bg-violet-50 px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-violet-700">
+                  <span>Window: {dfgLookback} blocks</span>
+                  <button
+                    type="button"
+                    onClick={() => setDfgLookback(null)}
+                    className="ml-1 text-violet-500 hover:text-violet-700"
+                  >
+                    ×
+                  </button>
+                </div>
+              )}
             </div>
           </div>
           <p className="muted-text mt-3 max-w-2xl text-sm">
-            DFGs are reconstructed from L1 logs per transaction. External inputs are handles not
-            produced inside the same tx.
+            DFGs are reconstructed from L1 logs per transaction. External inputs
+            are handles not produced inside the same tx.
+            {dfgLookback !== null && (
+              <span className="text-violet-600">
+                {" "}
+                Dashed edges show dependencies outside the {dfgLookback}-block
+                window.
+              </span>
+            )}
           </p>
 
-          <div className="mt-6 grid gap-6 lg:grid-cols-[280px_1fr]">
-            <div className="space-y-4">
-              {dfgSignatureSelection ? (
-                <div className="flex items-center justify-between rounded-2xl border border-black/10 bg-white/70 px-4 py-2 text-xs uppercase tracking-[0.2em]">
-                  <span className="text-black/70">
-                    Signature {shortenHandle(dfgSignatureSelection, 8, 6)} ·{" "}
-                    {formatNumber(dfgTotal)} matches
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setDfgSignatureSelection(null)}
-                    className="rounded-full border border-black/10 bg-white px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-black/70 transition hover:bg-black/5"
-                  >
-                    Clear
-                  </button>
-                </div>
-              ) : null}
-              <form onSubmit={handleDfgSearch} className="flex items-center gap-2">
-                <input
-                  value={dfgQuery}
-                  onChange={(event) => setDfgQuery(event.target.value)}
-                  placeholder="Search tx hash"
-                  className="w-full rounded-full border border-black/10 bg-white/80 px-4 py-2 text-sm"
-                />
+          <div className="mt-6 flex flex-wrap items-center gap-4">
+            {dfgSignatureSelection ? (
+              <div className="flex items-center gap-2 rounded-2xl border border-black/10 bg-white/70 px-4 py-2 text-xs uppercase tracking-[0.2em]">
+                <span className="text-black/70">
+                  Signature {shortenHandle(dfgSignatureSelection, 8, 6)} ·{" "}
+                  {formatNumber(dfgTotal)} matches
+                </span>
                 <button
-                  type="submit"
-                  className="rounded-full border border-black/10 bg-black/90 px-4 py-2 text-xs uppercase tracking-[0.2em] text-white transition hover:-translate-y-0.5"
+                  type="button"
+                  onClick={() => setDfgSignatureSelection(null)}
+                  className="rounded-full border border-black/10 bg-white px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-black/70 transition hover:bg-black/5"
                 >
-                  Load
+                  Clear
                 </button>
-              </form>
+              </div>
+            ) : null}
+            <form
+              onSubmit={handleDfgSearch}
+              className="flex items-center gap-2"
+            >
+              <input
+                value={dfgQuery}
+                onChange={(event) => setDfgQuery(event.target.value)}
+                placeholder="Search tx hash"
+                className="w-64 rounded-full border border-black/10 bg-white/80 px-4 py-2 text-sm"
+              />
+              <button
+                type="submit"
+                className="rounded-full border border-black/10 bg-black/90 px-4 py-2 text-xs uppercase tracking-[0.2em] text-white transition hover:-translate-y-0.5"
+              >
+                Load
+              </button>
+            </form>
+          </div>
 
-              <div className="rounded-2xl border border-black/10 bg-white/70 p-3">
-                <p className="muted-text text-[11px] uppercase tracking-[0.3em]">Recent DFGs</p>
-                <div className="mt-3 space-y-2">
-                  {dfgStatus === "loading" ? (
-                    <p className="muted-text text-sm">Loading DFGs...</p>
-                  ) : dfgStatus === "error" ? (
-                    <p className="muted-text text-sm">{dfgError ?? "Failed to load DFGs."}</p>
-                  ) : dfgTxs.length === 0 ? (
-                    <p className="muted-text text-sm">No DFGs found. Run `bun run dfg:build`.</p>
+          <div className="mt-6 space-y-6">
+            {dfgDetailStatus === "loading" ? (
+              <p className="muted-text text-sm">Loading DFG details...</p>
+            ) : dfgDetailStatus === "error" ? (
+              <p className="muted-text text-sm">
+                {dfgDetailError ?? "Failed to load DFG details."}
+              </p>
+            ) : !dfgSelected ? (
+              <p className="muted-text text-sm">Select a tx to view its DFG.</p>
+            ) : (
+              <>
+                <div className="grid gap-3 md:grid-cols-3">
+                  {[
+                    {
+                      label: "Block",
+                      value: formatNumber(dfgSelected.blockNumber),
+                    },
+                    {
+                      label: "Nodes",
+                      value: formatNumber(dfgSelected.nodeCount),
+                    },
+                    {
+                      label: "Edges",
+                      value: formatNumber(dfgSelected.edgeCount),
+                    },
+                  ].map((card) => (
+                    <div
+                      key={card.label}
+                      className="rounded-2xl border border-black/10 bg-white/70 p-4"
+                    >
+                      <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
+                        {card.label}
+                      </p>
+                      <p className="font-code mt-2 text-lg">{card.value}</p>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="rounded-2xl border border-black/10 bg-white/70 p-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <p className="muted-text text-xs uppercase tracking-[0.3em]">
+                      Graph view
+                    </p>
+                    <button
+                      type="button"
+                      onClick={resetGraphView}
+                      className="rounded-full border border-black/10 bg-white px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-black/70 transition hover:bg-black/5"
+                    >
+                      Reset view
+                    </button>
+                  </div>
+                  <p className="muted-text mt-2 text-xs">
+                    Scroll to zoom, drag to pan. Layout generated with dagre.
+                  </p>
+                  {dfgGraph ? (
+                    <div className="mt-4 h-[360px] w-full overflow-auto rounded-2xl border border-black/10 bg-white">
+                      <svg
+                        viewBox={
+                          dfgViewBox
+                            ? `${dfgViewBox.x} ${dfgViewBox.y} ${dfgViewBox.width} ${dfgViewBox.height}`
+                            : `${dfgGraph.viewBox.x} ${dfgGraph.viewBox.y} ${dfgGraph.viewBox.width} ${dfgGraph.viewBox.height}`
+                        }
+                        ref={dfgSvgRef}
+                        className={`h-full w-full ${dfgDragging ? "cursor-grabbing" : "cursor-grab"}`}
+                        onMouseDown={handleGraphMouseDown}
+                        onMouseMove={handleGraphMouseMove}
+                        onMouseUp={handleGraphMouseUp}
+                        onMouseLeave={handleGraphMouseUp}
+                        role="img"
+                        aria-label="Data flow graph visualization"
+                      >
+                        <g>
+                          {dfgGraph.edges.map((edge) => (
+                            <g key={edge.id}>
+                              <path
+                                d={edge.path}
+                                fill="none"
+                                stroke="rgba(15, 23, 42, 0.25)"
+                                strokeWidth="1.5"
+                              />
+                              {edge.label ? (
+                                <text
+                                  x={edge.labelX}
+                                  y={edge.labelY}
+                                  textAnchor="middle"
+                                  dominantBaseline="central"
+                                  fontSize="9"
+                                  fill="rgba(15, 23, 42, 0.8)"
+                                  paintOrder="stroke"
+                                  stroke="white"
+                                  strokeWidth="3"
+                                >
+                                  {edge.label}
+                                </text>
+                              ) : null}
+                            </g>
+                          ))}
+                        </g>
+                        <g>
+                          {dfgGraph.nodes.map((node) => {
+                            // Check if this node consumes any cut-edge handle
+                            const dfgNode = dfgNodes.find(
+                              (n) => String(n.nodeId) === node.id,
+                            );
+                            const hasCutEdge =
+                              dfgDetail?.cutEdges?.some((ce) =>
+                                dfgNode?.typeInfo?.inputs?.some(
+                                  (input) =>
+                                    input.kind === "external" &&
+                                    input.handle === ce.handle,
+                                ),
+                              ) ?? false;
+
+                            return (
+                              <g
+                                key={node.id}
+                                transform={`translate(${node.x}, ${node.y})`}
+                              >
+                                <rect
+                                  x={-node.width / 2}
+                                  y={-node.height / 2}
+                                  width={node.width}
+                                  height={node.height}
+                                  rx={12}
+                                  fill="white"
+                                  stroke={
+                                    hasCutEdge
+                                      ? "#7c3aed"
+                                      : "rgba(15, 23, 42, 0.2)"
+                                  }
+                                  strokeWidth={hasCutEdge ? 2 : 1}
+                                />
+                                {hasCutEdge && (
+                                  <circle
+                                    cx={-node.width / 2 - 4}
+                                    cy={0}
+                                    r={4}
+                                    fill="#7c3aed"
+                                  />
+                                )}
+                                <text
+                                  textAnchor="middle"
+                                  dominantBaseline="middle"
+                                  fontSize="11"
+                                  fill="rgba(15, 23, 42, 0.85)"
+                                >
+                                  {node.label}
+                                </text>
+                              </g>
+                            );
+                          })}
+                        </g>
+                      </svg>
+                    </div>
                   ) : (
-                    dfgTxs.map((row) => {
-                      const isActive = row.txHash === dfgSelection;
-                      return (
-                        <button
-                          key={row.txHash}
-                          type="button"
-                          onClick={() => {
-                            setDfgSelection(row.txHash);
-                            setDfgQuery(row.txHash);
-                          }}
-                          className={`w-full rounded-xl border px-3 py-2 text-left text-sm transition ${
-                            isActive
-                              ? "border-black/20 bg-white shadow-sm"
-                              : "border-black/5 bg-white/60 hover:border-black/15 hover:bg-white/80"
-                          }`}
-                        >
-                          <p className="font-code text-xs">{shortenHandle(row.txHash, 8, 6)}</p>
-                          <p className="muted-text mt-1 text-[11px] uppercase tracking-[0.18em]">
-                            Block {formatNumber(row.blockNumber)} · {row.nodeCount} nodes ·{" "}
-                            {row.depth} depth
-                          </p>
-                        </button>
-                      );
-                    })
+                    <p className="muted-text mt-4 text-sm">
+                      Graph data unavailable.
+                    </p>
                   )}
                 </div>
-              </div>
-            </div>
 
-            <div className="space-y-6">
-              {dfgDetailStatus === "loading" ? (
-                <p className="muted-text text-sm">Loading DFG details...</p>
-              ) : dfgDetailStatus === "error" ? (
-                <p className="muted-text text-sm">
-                  {dfgDetailError ?? "Failed to load DFG details."}
-                </p>
-              ) : !dfgSelected ? (
-                <p className="muted-text text-sm">Select a tx to view its DFG.</p>
-              ) : (
-                <>
-                  <div className="grid gap-3 md:grid-cols-3">
-                    {[
-                      { label: "Block", value: formatNumber(dfgSelected.blockNumber) },
-                      { label: "Nodes", value: formatNumber(dfgSelected.nodeCount) },
-                      { label: "Edges", value: formatNumber(dfgSelected.edgeCount) },
-                    ].map((card) => (
-                      <div
-                        key={card.label}
-                        className="rounded-2xl border border-black/10 bg-white/70 p-4"
-                      >
-                        <p className="muted-text text-[11px] uppercase tracking-[0.3em]">
-                          {card.label}
-                        </p>
-                        <p className="font-code mt-2 text-lg">{card.value}</p>
-                      </div>
-                    ))}
-                  </div>
-
+                <div className="grid gap-6 lg:grid-cols-2">
                   <div className="rounded-2xl border border-black/10 bg-white/70 p-4">
-                    <div className="flex items-center justify-between gap-4">
-                      <p className="muted-text text-xs uppercase tracking-[0.3em]">Graph view</p>
-                      <div className="flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={resetGraphView}
-                          className="rounded-full border border-black/10 bg-white px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-black/70 transition hover:bg-black/5"
-                        >
-                          Reset view
-                        </button>
-                        <span className="muted-text text-[11px] uppercase tracking-[0.2em]">
-                          {dfgGraphView ? "Visible" : "Hidden"}
-                        </span>
-                      </div>
-                    </div>
-                    <p className="muted-text mt-2 text-xs">
-                      Scroll to zoom, drag to pan. Layout generated with dagre.
+                    <p className="muted-text text-xs uppercase tracking-[0.3em]">
+                      Op counts
                     </p>
-                    {dfgGraphView ? (
-                      dfgGraph ? (
-                        <div className="mt-4 h-[360px] w-full overflow-auto rounded-2xl border border-black/10 bg-white">
-                          <svg
-                            viewBox={
-                              dfgViewBox
-                                ? `${dfgViewBox.x} ${dfgViewBox.y} ${dfgViewBox.width} ${dfgViewBox.height}`
-                                : `${dfgGraph.viewBox.x} ${dfgGraph.viewBox.y} ${dfgGraph.viewBox.width} ${dfgGraph.viewBox.height}`
-                            }
-                            className={`h-full w-full ${dfgDragging ? "cursor-grabbing" : "cursor-grab"}`}
-                            onWheel={handleGraphWheel}
-                            onMouseDown={handleGraphMouseDown}
-                            onMouseMove={handleGraphMouseMove}
-                            onMouseUp={handleGraphMouseUp}
-                            onMouseLeave={handleGraphMouseUp}
-                            role="img"
-                            aria-label="Data flow graph visualization"
-                          >
-                            <g>
-                              {dfgGraph.edges.map((edge) => (
-                                <g key={edge.id}>
-                                  <path
-                                    d={edge.path}
-                                    fill="none"
-                                    stroke="rgba(15, 23, 42, 0.25)"
-                                    strokeWidth="1.5"
-                                  />
-                                  {edge.label ? (
-                                    <text
-                                      x={edge.labelX}
-                                      y={edge.labelY}
-                                      textAnchor="middle"
-                                      dominantBaseline="central"
-                                      fontSize="9"
-                                      fill="rgba(15, 23, 42, 0.8)"
-                                      paintOrder="stroke"
-                                      stroke="white"
-                                      strokeWidth="3"
-                                    >
-                                      {edge.label}
-                                    </text>
-                                  ) : null}
-                                </g>
-                              ))}
-                            </g>
-                            <g>
-                              {dfgGraph.nodes.map((node) => (
-                                <g key={node.id} transform={`translate(${node.x}, ${node.y})`}>
-                                  <rect
-                                    x={-node.width / 2}
-                                    y={-node.height / 2}
-                                    width={node.width}
-                                    height={node.height}
-                                    rx={12}
-                                    fill="white"
-                                    stroke="rgba(15, 23, 42, 0.2)"
-                                    strokeWidth="1"
-                                  />
-                                  <text
-                                    textAnchor="middle"
-                                    dominantBaseline="middle"
-                                    fontSize="11"
-                                    fill="rgba(15, 23, 42, 0.85)"
-                                  >
-                                    {node.label}
-                                  </text>
-                                </g>
-                              ))}
-                            </g>
-                          </svg>
-                        </div>
-                      ) : (
-                        <p className="muted-text mt-4 text-sm">Graph data unavailable.</p>
-                      )
-                    ) : (
-                      <p className="muted-text mt-4 text-sm">
-                        Graph view is off. Toggle it on above.
-                      </p>
-                    )}
-                  </div>
-
-                  <div className="grid gap-6 lg:grid-cols-2">
-                    <div className="rounded-2xl border border-black/10 bg-white/70 p-4">
-                      <p className="muted-text text-xs uppercase tracking-[0.3em]">Op counts</p>
-                      <div className="mt-3 max-h-52 overflow-auto">
-                        {dfgOpRows.length === 0 ? (
-                          <p className="muted-text text-sm">No op counts recorded.</p>
-                        ) : (
-                          <table className="w-full text-sm">
-                            <thead className="text-left text-[11px] uppercase tracking-[0.2em] text-black/60">
-                              <tr>
-                                <th className="pb-2">Op</th>
-                                <th className="pb-2 text-right">Count</th>
-                              </tr>
-                            </thead>
-                            <tbody className="text-black/80">
-                              {dfgOpRows.map((row) => (
-                                <tr key={row.op}>
-                                  <td className="py-1">{row.op}</td>
-                                  <td className="py-1 text-right font-code">
-                                    {formatNumber(row.count)}
-                                  </td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        )}
-                      </div>
-                    </div>
-
-                    <div className="rounded-2xl border border-black/10 bg-white/70 p-4">
-                      <p className="muted-text text-xs uppercase tracking-[0.3em]">Input kinds</p>
-                      <div className="mt-3 max-h-52 overflow-auto">
-                        {dfgInputRows.length === 0 ? (
-                          <p className="muted-text text-sm">No input breakdown available.</p>
-                        ) : (
-                          <table className="w-full text-sm">
-                            <thead className="text-left text-[11px] uppercase tracking-[0.2em] text-black/60">
-                              <tr>
-                                <th className="pb-2">Op</th>
-                                <th className="pb-2 text-right">CT</th>
-                                <th className="pb-2 text-right">Trivial</th>
-                                <th className="pb-2 text-right">External</th>
-                                <th className="pb-2 text-right">Scalar</th>
-                              </tr>
-                            </thead>
-                            <tbody className="text-black/80">
-                              {dfgInputRows.map((row) => (
-                                <tr key={row.op}>
-                                  <td className="py-1">{row.op}</td>
-                                  <td className="py-1 text-right font-code">
-                                    {formatNumber(row.ciphertext)}
-                                  </td>
-                                  <td className="py-1 text-right font-code">
-                                    {formatNumber(row.trivial)}
-                                  </td>
-                                  <td className="py-1 text-right font-code">
-                                    {formatNumber(row.external)}
-                                  </td>
-                                  <td className="py-1 text-right font-code">
-                                    {formatNumber(row.scalar)}
-                                  </td>
-                                </tr>
-                              ))}
-                            </tbody>
-                          </table>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="rounded-2xl border border-black/10 bg-white/70 p-4">
-                    <div className="flex items-center justify-between gap-4">
-                      <p className="muted-text text-xs uppercase tracking-[0.3em]">Nodes</p>
-                      <span className="font-code text-xs">{formatNumber(dfgNodes.length)}</span>
-                    </div>
-                    <div className="mt-3 max-h-64 overflow-auto">
-                      {dfgNodes.length === 0 ? (
-                        <p className="muted-text text-sm">No nodes recorded.</p>
-                      ) : (
-                        <table className="w-full text-sm">
-                          <thead className="text-left text-[11px] uppercase tracking-[0.2em] text-black/60">
-                            <tr>
-                              <th className="pb-2">ID</th>
-                              <th className="pb-2">Op</th>
-                              <th className="pb-2">Inputs</th>
-                              <th className="pb-2">Output</th>
-                            </tr>
-                          </thead>
-                          <tbody className="text-black/80">
-                            {dfgNodes.map((node) => {
-                              const inputs = node.typeInfo?.inputs ?? [];
-                              const inputText =
-                                inputs.length === 0
-                                  ? "—"
-                                  : inputs
-                                      .map((input) => {
-                                        const typeLabel =
-                                          input.type !== undefined && input.type !== null
-                                            ? ` ${formatFheType(input.type)}`
-                                            : "";
-                                        return `${input.role}:${input.kind}${typeLabel}`;
-                                      })
-                                      .join(", ");
-                              const outputType = node.typeInfo?.output?.type;
-                              const outputKind = node.typeInfo?.output?.kind;
-                              const outputLabel = [
-                                shortenHandle(node.outputHandle),
-                                outputKind,
-                                outputType !== undefined && outputType !== null
-                                  ? formatFheType(outputType)
-                                  : null,
-                              ]
-                                .filter(Boolean)
-                                .join(" ");
-                              return (
-                                <tr key={node.nodeId}>
-                                  <td className="py-1 font-code">{node.nodeId}</td>
-                                  <td className="py-1">{node.op}</td>
-                                  <td className="py-1 text-xs text-black/70">{inputText}</td>
-                                  <td className="py-1 font-code text-xs">{outputLabel}</td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="rounded-2xl border border-black/10 bg-white/70 p-4">
-                    <div className="flex items-center justify-between gap-4">
-                      <p className="muted-text text-xs uppercase tracking-[0.3em]">Edges</p>
-                      <span className="font-code text-xs">{formatNumber(dfgEdges.length)}</span>
-                    </div>
                     <div className="mt-3 max-h-52 overflow-auto">
-                      {dfgEdges.length === 0 ? (
-                        <p className="muted-text text-sm">No edges recorded.</p>
+                      {dfgOpRows.length === 0 ? (
+                        <p className="muted-text text-sm">
+                          No op counts recorded.
+                        </p>
                       ) : (
                         <table className="w-full text-sm">
                           <thead className="text-left text-[11px] uppercase tracking-[0.2em] text-black/60">
                             <tr>
-                              <th className="pb-2">From</th>
-                              <th className="pb-2">To</th>
-                              <th className="pb-2">Handle</th>
-                              <th className="pb-2">Type</th>
+                              <th className="pb-2">Op</th>
+                              <th className="pb-2 text-right">Count</th>
                             </tr>
                           </thead>
                           <tbody className="text-black/80">
-                            {dfgEdges.map((edge, index) => (
-                              <tr key={`${edge.fromNodeId}-${edge.toNodeId}-${index}`}>
-                                <td className="py-1 font-code">{edge.fromNodeId}</td>
-                                <td className="py-1 font-code">{edge.toNodeId}</td>
-                                <td className="py-1 font-code text-xs">
-                                  {shortenHandle(edge.inputHandle)}
-                                </td>
-                                <td className="py-1 font-code text-xs">
-                                  {dfgEdgeTypes[index] ?? "—"}
+                            {dfgOpRows.map((row) => (
+                              <tr key={row.op}>
+                                <td className="py-1">{row.op}</td>
+                                <td className="py-1 text-right font-code">
+                                  {formatNumber(row.count)}
                                 </td>
                               </tr>
                             ))}
@@ -2716,35 +2547,220 @@ function App() {
                   </div>
 
                   <div className="rounded-2xl border border-black/10 bg-white/70 p-4">
-                    <div className="flex items-center justify-between gap-4">
-                      <p className="muted-text text-xs uppercase tracking-[0.3em]">
-                        External inputs
-                      </p>
-                      <span className="font-code text-xs">{formatNumber(dfgInputs.length)}</span>
-                    </div>
-                    <div className="mt-3 max-h-40 overflow-auto">
-                      {dfgInputs.length === 0 ? (
-                        <p className="muted-text text-sm">No external inputs.</p>
+                    <p className="muted-text text-xs uppercase tracking-[0.3em]">
+                      Input kinds
+                    </p>
+                    <div className="mt-3 max-h-52 overflow-auto">
+                      {dfgInputRows.length === 0 ? (
+                        <p className="muted-text text-sm">
+                          No input breakdown available.
+                        </p>
                       ) : (
-                        <div className="space-y-2">
-                          {dfgInputs.map((input) => (
-                            <div key={input.handle} className="text-xs font-code text-black/80">
-                              {shortenHandle(input.handle, 10, 8)} · {input.kind}
-                            </div>
-                          ))}
-                        </div>
+                        <table className="w-full text-sm">
+                          <thead className="text-left text-[11px] uppercase tracking-[0.2em] text-black/60">
+                            <tr>
+                              <th className="pb-2">Op</th>
+                              <th className="pb-2 text-right">CT</th>
+                              <th className="pb-2 text-right">Trivial</th>
+                              <th className="pb-2 text-right">External</th>
+                              <th className="pb-2 text-right">Scalar</th>
+                            </tr>
+                          </thead>
+                          <tbody className="text-black/80">
+                            {dfgInputRows.map((row) => (
+                              <tr key={row.op}>
+                                <td className="py-1">{row.op}</td>
+                                <td className="py-1 text-right font-code">
+                                  {formatNumber(row.ciphertext)}
+                                </td>
+                                <td className="py-1 text-right font-code">
+                                  {formatNumber(row.trivial)}
+                                </td>
+                                <td className="py-1 text-right font-code">
+                                  {formatNumber(row.external)}
+                                </td>
+                                <td className="py-1 text-right font-code">
+                                  {formatNumber(row.scalar)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
                       )}
                     </div>
                   </div>
-                </>
-              )}
-            </div>
+                </div>
+
+                <div className="rounded-2xl border border-black/10 bg-white/70 p-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <p className="muted-text text-xs uppercase tracking-[0.3em]">
+                      Nodes
+                    </p>
+                    <span className="font-code text-xs">
+                      {formatNumber(dfgNodes.length)}
+                    </span>
+                  </div>
+                  <div className="mt-3 max-h-64 overflow-auto">
+                    {dfgNodes.length === 0 ? (
+                      <p className="muted-text text-sm">No nodes recorded.</p>
+                    ) : (
+                      <table className="w-full text-sm">
+                        <thead className="text-left text-[11px] uppercase tracking-[0.2em] text-black/60">
+                          <tr>
+                            <th className="pb-2">ID</th>
+                            <th className="pb-2">Op</th>
+                            <th className="pb-2">Inputs</th>
+                            <th className="pb-2">Output</th>
+                          </tr>
+                        </thead>
+                        <tbody className="text-black/80">
+                          {dfgNodes.map((node) => {
+                            const inputs = node.typeInfo?.inputs ?? [];
+                            const inputText =
+                              inputs.length === 0
+                                ? "—"
+                                : inputs
+                                    .map((input) => {
+                                      const typeLabel =
+                                        input.type !== undefined &&
+                                        input.type !== null
+                                          ? ` ${formatFheType(input.type)}`
+                                          : "";
+                                      return `${input.role}:${input.kind}${typeLabel}`;
+                                    })
+                                    .join(", ");
+                            const outputType = node.typeInfo?.output?.type;
+                            const outputKind = node.typeInfo?.output?.kind;
+                            const outputLabel = [
+                              shortenHandle(node.outputHandle),
+                              outputKind,
+                              outputType !== undefined && outputType !== null
+                                ? formatFheType(outputType)
+                                : null,
+                            ]
+                              .filter(Boolean)
+                              .join(" ");
+                            return (
+                              <tr key={node.nodeId}>
+                                <td className="py-1 font-code">
+                                  {node.nodeId}
+                                </td>
+                                <td className="py-1">{node.op}</td>
+                                <td className="py-1 text-xs text-black/70">
+                                  {inputText}
+                                </td>
+                                <td className="py-1 font-code text-xs">
+                                  {outputLabel}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-black/10 bg-white/70 p-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <p className="muted-text text-xs uppercase tracking-[0.3em]">
+                      Edges
+                    </p>
+                    <span className="font-code text-xs">
+                      {formatNumber(dfgEdges.length)}
+                    </span>
+                  </div>
+                  <div className="mt-3 max-h-52 overflow-auto">
+                    {dfgEdges.length === 0 ? (
+                      <p className="muted-text text-sm">No edges recorded.</p>
+                    ) : (
+                      <table className="w-full text-sm">
+                        <thead className="text-left text-[11px] uppercase tracking-[0.2em] text-black/60">
+                          <tr>
+                            <th className="pb-2">From</th>
+                            <th className="pb-2">To</th>
+                            <th className="pb-2">Handle</th>
+                            <th className="pb-2">Type</th>
+                          </tr>
+                        </thead>
+                        <tbody className="text-black/80">
+                          {dfgEdges.map((edge, index) => (
+                            <tr
+                              key={`${edge.fromNodeId}-${edge.toNodeId}-${index}`}
+                            >
+                              <td className="py-1 font-code">
+                                {edge.fromNodeId}
+                              </td>
+                              <td className="py-1 font-code">
+                                {edge.toNodeId}
+                              </td>
+                              <td className="py-1 font-code text-xs">
+                                {shortenHandle(edge.inputHandle)}
+                              </td>
+                              <td className="py-1 font-code text-xs">
+                                {dfgEdgeTypes[index] ?? "—"}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-black/10 bg-white/70 p-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <p className="muted-text text-xs uppercase tracking-[0.3em]">
+                      External inputs
+                    </p>
+                    <div className="flex items-center gap-2">
+                      {dfgDetail?.cutEdges && dfgDetail.cutEdges.length > 0 && (
+                        <span className="text-[10px] text-violet-600 uppercase tracking-wider">
+                          {dfgDetail.cutEdges.length} outside window
+                        </span>
+                      )}
+                      <span className="font-code text-xs">
+                        {formatNumber(dfgInputs.length)}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="mt-3 max-h-40 overflow-auto">
+                    {dfgInputs.length === 0 ? (
+                      <p className="muted-text text-sm">No external inputs.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {dfgInputs.map((input) => {
+                          const cutEdge = dfgDetail?.cutEdges?.find(
+                            (ce) => ce.handle === input.handle,
+                          );
+                          const isCut = Boolean(cutEdge);
+                          return (
+                            <div
+                              key={input.handle}
+                              className={`text-xs font-code ${isCut ? "text-violet-600" : "text-black/80"}`}
+                            >
+                              {shortenHandle(input.handle, 10, 8)} ·{" "}
+                              {input.kind}
+                              {isCut && cutEdge && (
+                                <span className="ml-2 text-[10px] text-violet-500">
+                                  ← block {formatNumber(cutEdge.producerBlock)}
+                                </span>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </>
+            )}
           </div>
         </section>
 
         <footer className="muted-text mt-6 text-xs uppercase tracking-[0.2em]">
-          Raw events remain the source of truth. Bucketed rollups kick in when performance demands
-          it.
+          Raw events remain the source of truth. Bucketed rollups kick in when
+          performance demands it.
         </footer>
       </div>
     </div>
