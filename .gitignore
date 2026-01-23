@@ -36,3 +36,6 @@ data
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# Local handoff docs
+*_HANDOFF.md
