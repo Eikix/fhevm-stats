@@ -1,0 +1,9 @@
+#!/bin/sh
+
+# Run TypeScript type check
+echo "Running TypeScript check..."
+cd ui && bunx tsc --noEmit || exit 1
+
+# Run lint-staged (prettier + eslint on staged files)
+echo "Running lint-staged..."
+bunx lint-staged || exit 1
