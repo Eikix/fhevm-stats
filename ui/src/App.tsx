@@ -2320,7 +2320,7 @@ function App() {
                         dfgSignatureTotal,
                       )}`}
               </p>
-              <div className="flex items-center gap-2 rounded-full border border-black/10 bg-white/80 px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-black/70">
+              <div className="flex w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-2xl border border-black/10 bg-white/80 px-3 py-2 text-[10px] uppercase tracking-[0.2em] text-black/70 sm:w-auto">
                 <span>Min nodes</span>
                 <input
                   type="number"
@@ -2332,7 +2332,7 @@ function App() {
                       Number.isFinite(next) ? Math.max(0, next) : 0,
                     );
                   }}
-                  className="w-14 rounded-full border border-black/10 bg-white px-2 py-1 text-center text-[10px] uppercase tracking-[0.2em]"
+                  className="w-14 shrink-0 rounded-full border border-black/10 bg-white px-2 py-1 text-center text-[10px] uppercase tracking-[0.2em]"
                 />
                 <span>Min edges</span>
                 <input
@@ -2345,7 +2345,7 @@ function App() {
                       Number.isFinite(next) ? Math.max(0, next) : 0,
                     );
                   }}
-                  className="w-14 rounded-full border border-black/10 bg-white px-2 py-1 text-center text-[10px] uppercase tracking-[0.2em]"
+                  className="w-14 shrink-0 rounded-full border border-black/10 bg-white px-2 py-1 text-center text-[10px] uppercase tracking-[0.2em]"
                 />
                 <span className="hidden sm:inline">Scope</span>
                 <button
@@ -2378,7 +2378,7 @@ function App() {
                       min={0}
                       value={dfgStartBlock}
                       onChange={(event) => setDfgStartBlock(event.target.value)}
-                      className="w-28 rounded-full border border-black/10 bg-white px-3 py-1 text-center text-[10px] uppercase tracking-[0.2em]"
+                      className="w-24 shrink-0 rounded-full border border-black/10 bg-white px-3 py-1 text-center text-[10px] uppercase tracking-[0.2em] sm:w-28"
                     />
                     <span className="hidden sm:inline">End</span>
                     <input
@@ -2386,7 +2386,7 @@ function App() {
                       min={0}
                       value={dfgEndBlock}
                       onChange={(event) => setDfgEndBlock(event.target.value)}
-                      className="w-28 rounded-full border border-black/10 bg-white px-3 py-1 text-center text-[10px] uppercase tracking-[0.2em]"
+                      className="w-24 shrink-0 rounded-full border border-black/10 bg-white px-3 py-1 text-center text-[10px] uppercase tracking-[0.2em] sm:w-28"
                     />
                     <button
                       type="button"
@@ -2406,7 +2406,7 @@ function App() {
                   value={dfgCaller}
                   onChange={(event) => setDfgCaller(event.target.value)}
                   placeholder="0x…"
-                  className="w-56 rounded-full border border-black/10 bg-white px-3 py-1 text-[10px] uppercase tracking-[0.2em]"
+                  className="w-full min-w-[10rem] flex-1 rounded-full border border-black/10 bg-white px-3 py-1 text-[10px] uppercase tracking-[0.2em] sm:w-56 sm:flex-none"
                 />
                 <button
                   type="button"
