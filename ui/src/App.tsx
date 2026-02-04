@@ -444,6 +444,10 @@ function App() {
     "loading",
   );
   const [error, setError] = useState<string | null>(null);
+  const [opsStatus, setOpsStatus] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle");
+  const [opsError, setOpsError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [ingestion, setIngestion] = useState<IngestionResponse | null>(null);
@@ -622,25 +626,17 @@ function App() {
     const cacheBust = refreshKey;
     const query = buildQuery(chainId, cacheBust);
 
-    const load = async () => {
+    const loadSummary = async () => {
       setStatus("loading");
       setError(null);
       try {
-        const [summaryResponse, opsResponse] = await Promise.all([
-          fetchJson<SummaryResponse>(
-            `${API_BASE}/stats/summary?${query}`,
-            controller.signal,
-          ),
-          fetchJson<OpsResponse>(
-            `${API_BASE}/stats/ops?${query}`,
-            controller.signal,
-          ),
-        ]);
+        const summaryResponse = await fetchJson<SummaryResponse>(
+          `${API_BASE}/stats/summary?${query}`,
+          controller.signal,
+        );
 
         if (controller.signal.aborted) return;
-
         setSummary(summaryResponse.summary ?? null);
-        setOps(opsResponse.rows ?? []);
         setLastUpdated(new Date().toLocaleString());
         setStatus("ready");
       } catch (err) {
@@ -650,7 +646,26 @@ function App() {
       }
     };
 
-    load();
+    const loadOps = async () => {
+      setOpsStatus("loading");
+      setOpsError(null);
+      try {
+        const opsResponse = await fetchJson<OpsResponse>(
+          `${API_BASE}/stats/ops?${query}`,
+          controller.signal,
+        );
+        if (controller.signal.aborted) return;
+        setOps(opsResponse.rows ?? []);
+        setOpsStatus("ready");
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        setOpsError(err instanceof Error ? err.message : "Failed to load ops.");
+        setOpsStatus("error");
+      }
+    };
+
+    loadSummary();
+    loadOps();
     return () => controller.abort();
   }, [chainId, refreshKey]);
 
@@ -1529,7 +1544,11 @@ function App() {
               </h2>
             </div>
             <p className="muted-text text-xs uppercase tracking-[0.2em]">
-              Showing {topOps.length || 0} of {ops.length}
+              {opsStatus === "loading"
+                ? "Loading"
+                : opsStatus === "error"
+                  ? "Error"
+                  : `Showing ${topOps.length || 0} of ${ops.length}`}
             </p>
           </div>
 
@@ -1544,13 +1563,21 @@ function App() {
                     Total
                   </span>
                   <span className="font-code text-xl">
-                    {formatNumber(totalOps)}
+                    {opsStatus === "loading" ? "—" : formatNumber(totalOps)}
                   </span>
                 </div>
               </div>
 
               <div className="w-full space-y-3 text-sm">
-                {pieSegments.length === 0 ? (
+                {opsStatus === "loading" ? (
+                  <p className="muted-text text-sm">
+                    Loading event distribution…
+                  </p>
+                ) : opsStatus === "error" ? (
+                  <p className="muted-text text-sm">
+                    {opsError ?? "Failed to load ops distribution."}
+                  </p>
+                ) : pieSegments.length === 0 ? (
                   <p className="muted-text text-sm">
                     No events yet. Run backfill or stream to populate the DB.
                   </p>
@@ -1579,7 +1606,13 @@ function App() {
             </div>
 
             <div className="grid gap-4">
-              {topOps.length === 0 ? (
+              {opsStatus === "loading" ? (
+                <p className="muted-text text-sm">Loading events…</p>
+              ) : opsStatus === "error" ? (
+                <p className="muted-text text-sm">
+                  {opsError ?? "Failed to load events."}
+                </p>
+              ) : topOps.length === 0 ? (
                 <p className="muted-text text-sm">
                   No events yet. Run backfill or stream to populate the DB.
                 </p>
