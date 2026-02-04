@@ -491,6 +491,29 @@ function App() {
   });
   const defaultCallerAppliedRef = useRef(false);
   const dfgResetRef = useRef<{ chainId: number; caller: string } | null>(null);
+  const [dfgRangeMode, setDfgRangeMode] = useState<"window" | "range">(() => {
+    try {
+      const value = localStorage.getItem("dfgRangeMode");
+      return value === "range" ? "range" : "window";
+    } catch {
+      return "window";
+    }
+  });
+  const [dfgStartBlock, setDfgStartBlock] = useState(() => {
+    try {
+      return localStorage.getItem("dfgStartBlock") ?? "";
+    } catch {
+      return "";
+    }
+  });
+  const [dfgEndBlock, setDfgEndBlock] = useState(() => {
+    try {
+      return localStorage.getItem("dfgEndBlock") ?? "";
+    } catch {
+      return "";
+    }
+  });
+  const defaultRangeAppliedRef = useRef(false);
   const [dfgStats, setDfgStats] = useState<DfgStatsResponse | null>(null);
   const [dfgStatsStatus, setDfgStatsStatus] = useState<
     "idle" | "loading" | "ready" | "error"
@@ -541,10 +564,13 @@ function App() {
   useEffect(() => {
     try {
       localStorage.setItem("dfgCaller", dfgCaller);
+      localStorage.setItem("dfgRangeMode", dfgRangeMode);
+      localStorage.setItem("dfgStartBlock", dfgStartBlock);
+      localStorage.setItem("dfgEndBlock", dfgEndBlock);
     } catch {
       // ignore
     }
-  }, [dfgCaller]);
+  }, [dfgCaller, dfgRangeMode, dfgStartBlock, dfgEndBlock]);
 
   useEffect(() => {
     if (chainId !== 11155111) return;
@@ -559,6 +585,27 @@ function App() {
       // ignore
     }
   }, [chainId]);
+
+  useEffect(() => {
+    if (chainId !== 11155111) return;
+    if (
+      dfgCaller.trim().toLowerCase() !==
+      "0x9fdd4b67c241779dca4d2eaf3d5946fb699f5d7a"
+    )
+      return;
+    if (defaultRangeAppliedRef.current) return;
+    if (summary?.maxBlock == null) return;
+    // Avoid applying a Sepolia preset based on stale Mainnet summary data during the network switch.
+    if (summary.maxBlock > 20_000_000) return;
+    defaultRangeAppliedRef.current = true;
+
+    // Roughly 17 hours ≈ ~5100 blocks (12s). Give a little buffer.
+    const end = summary.maxBlock;
+    const start = Math.max(0, end - 5200);
+    setDfgRangeMode("range");
+    setDfgStartBlock(String(start));
+    setDfgEndBlock(String(end));
+  }, [chainId, dfgCaller, summary?.maxBlock]);
 
   useEffect(() => {
     const prev = dfgResetRef.current;
@@ -693,11 +740,22 @@ function App() {
     }
     params.set("cacheBust", cacheBust.toString());
 
-    if (summary?.maxBlock != null) {
-      const endBlock = summary.maxBlock;
-      const startBlock = Math.max(0, endBlock - windowLookback + 1);
-      params.set("startBlock", startBlock.toString());
-      params.set("endBlock", endBlock.toString());
+    if (dfgRangeMode === "window") {
+      if (summary?.maxBlock != null) {
+        const endBlock = summary.maxBlock;
+        const startBlock = Math.max(0, endBlock - windowLookback + 1);
+        params.set("startBlock", startBlock.toString());
+        params.set("endBlock", endBlock.toString());
+      }
+    } else {
+      const start = Number(dfgStartBlock);
+      const end = Number(dfgEndBlock);
+      if (Number.isFinite(start) && start >= 0) {
+        params.set("startBlock", String(Math.floor(start)));
+      }
+      if (Number.isFinite(end) && end >= 0) {
+        params.set("endBlock", String(Math.floor(end)));
+      }
     }
 
     const load = async () => {
@@ -736,6 +794,9 @@ function App() {
     refreshKey,
     dfgSignatureSelection,
     dfgCaller,
+    dfgRangeMode,
+    dfgStartBlock,
+    dfgEndBlock,
     windowLookback,
     summary?.maxBlock,
   ]);
@@ -753,12 +814,23 @@ function App() {
     }
     params.set("cacheBust", cacheBust.toString());
 
-    // Apply window-based block range filtering if we have block info
-    if (summary?.maxBlock != null) {
-      const endBlock = summary.maxBlock;
-      const startBlock = Math.max(0, endBlock - windowLookback + 1);
-      params.set("startBlock", startBlock.toString());
-      params.set("endBlock", endBlock.toString());
+    if (dfgRangeMode === "window") {
+      // Apply window-based block range filtering if we have block info
+      if (summary?.maxBlock != null) {
+        const endBlock = summary.maxBlock;
+        const startBlock = Math.max(0, endBlock - windowLookback + 1);
+        params.set("startBlock", startBlock.toString());
+        params.set("endBlock", endBlock.toString());
+      }
+    } else {
+      const start = Number(dfgStartBlock);
+      const end = Number(dfgEndBlock);
+      if (Number.isFinite(start) && start >= 0) {
+        params.set("startBlock", String(Math.floor(start)));
+      }
+      if (Number.isFinite(end) && end >= 0) {
+        params.set("endBlock", String(Math.floor(end)));
+      }
     }
 
     const load = async () => {
@@ -792,6 +864,9 @@ function App() {
     dfgSignatureMinNodes,
     dfgSignatureMinEdges,
     dfgCaller,
+    dfgRangeMode,
+    dfgStartBlock,
+    dfgEndBlock,
     windowLookback,
     summary?.maxBlock,
   ]);
@@ -2272,6 +2347,60 @@ function App() {
                   }}
                   className="w-14 rounded-full border border-black/10 bg-white px-2 py-1 text-center text-[10px] uppercase tracking-[0.2em]"
                 />
+                <span className="hidden sm:inline">Scope</span>
+                <button
+                  type="button"
+                  onClick={() => setDfgRangeMode("window")}
+                  className={`rounded-full border border-black/10 px-2 py-0.5 text-[9px] uppercase tracking-[0.2em] transition ${
+                    dfgRangeMode === "window"
+                      ? "bg-black/80 text-white"
+                      : "bg-white/80 text-black/60 hover:bg-white"
+                  }`}
+                >
+                  window
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDfgRangeMode("range")}
+                  className={`rounded-full border border-black/10 px-2 py-0.5 text-[9px] uppercase tracking-[0.2em] transition ${
+                    dfgRangeMode === "range"
+                      ? "bg-black/80 text-white"
+                      : "bg-white/80 text-black/60 hover:bg-white"
+                  }`}
+                >
+                  range
+                </button>
+                {dfgRangeMode === "range" && (
+                  <>
+                    <span className="hidden sm:inline">Start</span>
+                    <input
+                      type="number"
+                      min={0}
+                      value={dfgStartBlock}
+                      onChange={(event) => setDfgStartBlock(event.target.value)}
+                      className="w-28 rounded-full border border-black/10 bg-white px-3 py-1 text-center text-[10px] uppercase tracking-[0.2em]"
+                    />
+                    <span className="hidden sm:inline">End</span>
+                    <input
+                      type="number"
+                      min={0}
+                      value={dfgEndBlock}
+                      onChange={(event) => setDfgEndBlock(event.target.value)}
+                      className="w-28 rounded-full border border-black/10 bg-white px-3 py-1 text-center text-[10px] uppercase tracking-[0.2em]"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (summary?.maxBlock != null)
+                          setDfgEndBlock(String(summary.maxBlock));
+                      }}
+                      className="rounded-full border border-black/10 bg-white/80 px-2 py-0.5 text-[9px] uppercase tracking-[0.2em] text-black/60 transition hover:bg-white"
+                      title="Set end block to latest block in the local DB"
+                    >
+                      max
+                    </button>
+                  </>
+                )}
                 <span className="hidden sm:inline">Caller</span>
                 <input
                   value={dfgCaller}

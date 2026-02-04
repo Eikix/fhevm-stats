@@ -308,6 +308,16 @@ export function initDatabase(dbPath: string): Database {
     CREATE INDEX IF NOT EXISTS fhe_events_event
       ON fhe_events(chain_id, event_name);
 
+    CREATE TABLE IF NOT EXISTS tx_callers (
+      chain_id INTEGER NOT NULL,
+      tx_hash TEXT NOT NULL,
+      caller TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (chain_id, tx_hash)
+    );
+    CREATE INDEX IF NOT EXISTS tx_callers_by_caller
+      ON tx_callers(chain_id, caller, tx_hash);
+
     CREATE TABLE IF NOT EXISTS checkpoints (
       chain_id INTEGER PRIMARY KEY,
       last_block INTEGER NOT NULL,
@@ -523,6 +533,15 @@ function prepareStatements(db: Database) {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
+  const insertTxCaller = db.prepare(`
+    INSERT OR IGNORE INTO tx_callers (
+      chain_id,
+      tx_hash,
+      caller
+    )
+    VALUES (?, ?, ?)
+  `);
+
   const getCheckpoint = db.prepare(`
     SELECT last_block FROM checkpoints WHERE chain_id = ?
   `);
@@ -535,7 +554,7 @@ function prepareStatements(db: Database) {
           updated_at = datetime('now')
   `);
 
-  return { insertEvent, getCheckpoint, upsertCheckpoint };
+  return { insertEvent, insertTxCaller, getCheckpoint, upsertCheckpoint };
 }
 
 function readCheckpoint(
@@ -810,6 +829,7 @@ async function processRange(
   for (const log of logs) {
     let eventName = "Unknown";
     let argsJson: string | null = null;
+    let callerLower: string | null = null;
     let derived: DerivedFields = {};
     try {
       const decoded = decodeEventLog({
@@ -819,6 +839,10 @@ async function processRange(
       });
       eventName = decoded.eventName;
       const args = decoded.args as Record<string, unknown>;
+      const caller = args.caller;
+      if (typeof caller === "string" && caller.toLowerCase().startsWith("0x")) {
+        callerLower = caller.toLowerCase();
+      }
       argsJson = serializeArgs(args);
       derived = deriveEventFields(eventName, args);
       const mismatch = validateDerivedTypes(eventName, derived);
@@ -860,6 +884,10 @@ async function processRange(
       derived.scalarFlag ?? null,
       derived.resultHandleVersion ?? null,
     );
+
+    if (callerLower) {
+      statements.insertTxCaller.run(chainId, log.transactionHash, callerLower);
+    }
   }
 
   statements.upsertCheckpoint.run(chainId, toBlock);

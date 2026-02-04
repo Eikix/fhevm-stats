@@ -465,6 +465,7 @@ function handleDfgTxs(url: URL): Response {
   const caller = url.searchParams.get("caller") ?? undefined;
   const startBlock = parseNumber(url.searchParams.get("startBlock"));
   const endBlock = parseNumber(url.searchParams.get("endBlock"));
+  const hasTxCallers = hasTable("tx_callers");
 
   const clauses = ["chain_id = $chainId"];
   const params: Record<string, string | number> = { $chainId: chainId };
@@ -487,14 +488,23 @@ function handleDfgTxs(url: URL): Response {
   }
   if (caller) {
     clauses.push(
-      `EXISTS (
-        SELECT 1
-        FROM fhe_events e
-        WHERE e.chain_id = dfg_txs.chain_id
-          AND e.tx_hash = dfg_txs.tx_hash
-          AND lower(json_extract(e.args_json, '$.caller')) = $callerLower
-        LIMIT 1
-      )`,
+      hasTxCallers
+        ? `EXISTS (
+            SELECT 1
+            FROM tx_callers c
+            WHERE c.chain_id = dfg_txs.chain_id
+              AND c.tx_hash = dfg_txs.tx_hash
+              AND c.caller = $callerLower
+            LIMIT 1
+          )`
+        : `EXISTS (
+            SELECT 1
+            FROM fhe_events e
+            WHERE e.chain_id = dfg_txs.chain_id
+              AND e.tx_hash = dfg_txs.tx_hash
+              AND lower(json_extract(e.args_json, '$.caller')) = $callerLower
+            LIMIT 1
+          )`,
     );
     params.$callerLower = caller.toLowerCase();
   }
@@ -720,6 +730,7 @@ function handleDfgSignatures(url: URL): Response {
   const startBlock = parseNumber(url.searchParams.get("startBlock"));
   const endBlock = parseNumber(url.searchParams.get("endBlock"));
   const caller = url.searchParams.get("caller") ?? undefined;
+  const hasTxCallers = hasTable("tx_callers");
 
   // Build WHERE clauses for optional block range filtering
   const whereClauses = [
@@ -746,14 +757,23 @@ function handleDfgSignatures(url: URL): Response {
   }
   if (caller) {
     whereClauses.push(
-      `EXISTS (
-        SELECT 1
-        FROM fhe_events e
-        WHERE e.chain_id = dfg_txs.chain_id
-          AND e.tx_hash = dfg_txs.tx_hash
-          AND lower(json_extract(e.args_json, '$.caller')) = $callerLower
-        LIMIT 1
-      )`,
+      hasTxCallers
+        ? `EXISTS (
+            SELECT 1
+            FROM tx_callers c
+            WHERE c.chain_id = dfg_txs.chain_id
+              AND c.tx_hash = dfg_txs.tx_hash
+              AND c.caller = $callerLower
+            LIMIT 1
+          )`
+        : `EXISTS (
+            SELECT 1
+            FROM fhe_events e
+            WHERE e.chain_id = dfg_txs.chain_id
+              AND e.tx_hash = dfg_txs.tx_hash
+              AND lower(json_extract(e.args_json, '$.caller')) = $callerLower
+            LIMIT 1
+          )`,
     );
     params.$callerLower = caller.toLowerCase();
   }
