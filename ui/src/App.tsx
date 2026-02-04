@@ -450,6 +450,7 @@ function App() {
   const [opsError, setOpsError] = useState<string | null>(null);
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [autoRefreshKey, setAutoRefreshKey] = useState(0);
   const [ingestion, setIngestion] = useState<IngestionResponse | null>(null);
   const [ingestionStatus, setIngestionStatus] = useState<
     "loading" | "ready" | "error"
@@ -622,8 +623,16 @@ function App() {
   }, [chainId, dfgCaller]);
 
   useEffect(() => {
+    const interval = window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      setAutoRefreshKey((current) => current + 1);
+    }, 60_000);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
     const controller = new AbortController();
-    const cacheBust = refreshKey;
+    const cacheBust = refreshKey + autoRefreshKey;
     const query = buildQuery(chainId, cacheBust);
 
     const loadSummary = async () => {
@@ -667,13 +676,13 @@ function App() {
     loadSummary();
     loadOps();
     return () => controller.abort();
-  }, [chainId, refreshKey]);
+  }, [chainId, refreshKey, autoRefreshKey]);
 
   useEffect(() => {
     const controller = new AbortController();
     const params = new URLSearchParams();
     params.set("chainId", chainId.toString());
-    params.set("cacheBust", refreshKey.toString());
+    params.set("cacheBust", (refreshKey + autoRefreshKey).toString());
 
     setIngestionStatus("loading");
     setIngestionError(null);
@@ -697,7 +706,7 @@ function App() {
       });
 
     return () => controller.abort();
-  }, [chainId, refreshKey]);
+  }, [chainId, refreshKey, autoRefreshKey]);
 
   useEffect(() => {
     const controller = new AbortController();
