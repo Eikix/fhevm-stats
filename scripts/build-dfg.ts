@@ -102,6 +102,13 @@ function parseArgs(argsJson: string | null): Record<string, unknown> | null {
   }
 }
 
+function hasTable(db: ReturnType<typeof initDatabase>, name: string): boolean {
+  const row = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = $name")
+    .get({ $name: name }) as { name: string } | undefined;
+  return Boolean(row);
+}
+
 function normalizeHandle(value: unknown): string | null {
   if (typeof value !== "string") return null;
   if (!value.startsWith("0x") || value.length !== 66) return null;
@@ -389,6 +396,115 @@ function computeSignature(nodes: DfgNode[], edges: DfgEdge[]): string {
     nodes.map((node) => ({ nodeId: node.nodeId, op: node.op })),
     edges.map((edge) => ({ fromNodeId: edge.fromNodeId, toNodeId: edge.toNodeId })),
   );
+}
+
+function updateDfgStatsRollup(db: ReturnType<typeof initDatabase>, chainId: number): void {
+  if (!hasTable(db, "dfg_stats_rollups")) return;
+
+  const dfgRow = db
+    .prepare(
+      `SELECT COUNT(*) AS total,
+              AVG(node_count) AS avgNodes,
+              AVG(edge_count) AS avgEdges,
+              AVG(depth) AS avgDepth,
+              MIN(node_count) AS minNodes,
+              MAX(node_count) AS maxNodes,
+              MIN(edge_count) AS minEdges,
+              MAX(edge_count) AS maxEdges,
+              MIN(depth) AS minDepth,
+              MAX(depth) AS maxDepth,
+              COUNT(DISTINCT signature_hash) AS signatureCount,
+              MAX(block_number) AS maxBlock
+       FROM dfg_txs
+       WHERE chain_id = $chainId`,
+    )
+    .get({ $chainId: chainId }) as {
+    total: number;
+    avgNodes: number | null;
+    avgEdges: number | null;
+    avgDepth: number | null;
+    minNodes: number | null;
+    maxNodes: number | null;
+    minEdges: number | null;
+    maxEdges: number | null;
+    minDepth: number | null;
+    maxDepth: number | null;
+    signatureCount: number;
+    maxBlock: number | null;
+  };
+
+  let eventTxCount: number | null = null;
+  if (hasTable(db, "tx_counts")) {
+    const txCountRow = db
+      .prepare("SELECT count FROM tx_counts WHERE chain_id = $chainId")
+      .get({ $chainId: chainId }) as { count: number } | undefined;
+    eventTxCount = txCountRow?.count ?? null;
+  }
+
+  db.prepare(
+    `INSERT INTO dfg_stats_rollups (
+       chain_id,
+       total,
+       avg_nodes,
+       avg_edges,
+       avg_depth,
+       min_nodes,
+       max_nodes,
+       min_edges,
+       max_edges,
+       min_depth,
+       max_depth,
+       signature_count,
+       event_tx_count,
+       max_block
+     )
+     VALUES (
+       $chainId,
+       $total,
+       $avgNodes,
+       $avgEdges,
+       $avgDepth,
+       $minNodes,
+       $maxNodes,
+       $minEdges,
+       $maxEdges,
+       $minDepth,
+       $maxDepth,
+       $signatureCount,
+       $eventTxCount,
+       $maxBlock
+     )
+     ON CONFLICT(chain_id) DO UPDATE
+       SET total = excluded.total,
+           avg_nodes = excluded.avg_nodes,
+           avg_edges = excluded.avg_edges,
+           avg_depth = excluded.avg_depth,
+           min_nodes = excluded.min_nodes,
+           max_nodes = excluded.max_nodes,
+           min_edges = excluded.min_edges,
+           max_edges = excluded.max_edges,
+           min_depth = excluded.min_depth,
+           max_depth = excluded.max_depth,
+           signature_count = excluded.signature_count,
+           event_tx_count = excluded.event_tx_count,
+           max_block = excluded.max_block,
+           updated_at = datetime('now')`,
+  ).run({
+    $chainId: chainId,
+    $total: dfgRow.total,
+    $avgNodes: dfgRow.avgNodes,
+    $avgEdges: dfgRow.avgEdges,
+    $avgDepth: dfgRow.avgDepth,
+    $minNodes: dfgRow.minNodes,
+    $maxNodes: dfgRow.maxNodes,
+    $minEdges: dfgRow.minEdges,
+    $maxEdges: dfgRow.maxEdges,
+    $minDepth: dfgRow.minDepth,
+    $maxDepth: dfgRow.maxDepth,
+    $signatureCount: dfgRow.signatureCount,
+    $eventTxCount: eventTxCount,
+    $maxBlock: dfgRow.maxBlock,
+  });
 }
 
 const dbPath = Bun.env.DB_PATH ?? DEFAULT_DB_PATH;
@@ -736,6 +852,12 @@ if (useIncremental && chainId !== undefined && lastTx) {
   } else {
     deleteCheckpoint.run({ $chainId: chainId });
   }
+}
+
+const rollupChains =
+  chainId !== undefined ? [chainId] : Array.from(new Set(txRows.map((row) => row.chain_id)));
+for (const rollupChainId of rollupChains) {
+  updateDfgStatsRollup(db, rollupChainId);
 }
 
 console.log(

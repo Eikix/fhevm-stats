@@ -14,6 +14,8 @@
     "rollup:ops": "bun run scripts/rollup-ops.ts",
     "rollup:ops:all": "bun run scripts/rollup-ops-all.ts",
     "backfill:op-counts": "bun run scripts/backfill-op-counts.ts",
+    "backfill:tx-counts": "bun run scripts/backfill-tx-counts.ts",
+    "backfill:dfg-stats": "bun run scripts/backfill-dfg-stats-rollup.ts",
     "dfg:build": "bun run scripts/build-dfg.ts",
     "dfg:validate": "bun run scripts/validate-dfg.ts",
     "dfg:validate:inputs": "bun run scripts/validate-dfg-inputs.ts",

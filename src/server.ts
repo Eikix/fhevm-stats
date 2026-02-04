@@ -866,69 +866,137 @@ function handleDfgStats(url: URL): Response {
     return jsonResponse({ error: "dfg_tables_missing" }, 404);
   }
 
-  const dfgRow = db
-    .prepare(
-      `SELECT COUNT(*) AS total,
-              AVG(node_count) AS avgNodes,
-              AVG(edge_count) AS avgEdges,
-              AVG(depth) AS avgDepth,
-              MIN(node_count) AS minNodes,
-              MAX(node_count) AS maxNodes,
-              MIN(edge_count) AS minEdges,
-              MAX(edge_count) AS maxEdges,
-              MIN(depth) AS minDepth,
-              MAX(depth) AS maxDepth,
-              COUNT(DISTINCT signature_hash) AS signatureCount
-       FROM dfg_txs
-       WHERE chain_id = $chainId`,
-    )
-    .get({ $chainId: chainId }) as {
-    total: number;
-    avgNodes: number | null;
-    avgEdges: number | null;
-    avgDepth: number | null;
-    minNodes: number | null;
-    maxNodes: number | null;
-    minEdges: number | null;
-    maxEdges: number | null;
-    minDepth: number | null;
-    maxDepth: number | null;
-    signatureCount: number;
-  };
+  const rollupRow = hasTable("dfg_stats_rollups")
+    ? (db
+        .prepare(
+          `SELECT total,
+                  avg_nodes AS avgNodes,
+                  avg_edges AS avgEdges,
+                  avg_depth AS avgDepth,
+                  min_nodes AS minNodes,
+                  max_nodes AS maxNodes,
+                  min_edges AS minEdges,
+                  max_edges AS maxEdges,
+                  min_depth AS minDepth,
+                  max_depth AS maxDepth,
+                  signature_count AS signatureCount,
+                  event_tx_count AS eventTxCount
+           FROM dfg_stats_rollups
+           WHERE chain_id = $chainId`,
+        )
+        .get({ $chainId: chainId }) as
+        | {
+            total: number;
+            avgNodes: number | null;
+            avgEdges: number | null;
+            avgDepth: number | null;
+            minNodes: number | null;
+            maxNodes: number | null;
+            minEdges: number | null;
+            maxEdges: number | null;
+            minDepth: number | null;
+            maxDepth: number | null;
+            signatureCount: number | null;
+            eventTxCount: number | null;
+          }
+        | undefined)
+    : undefined;
 
-  const txRow = db
-    .prepare("SELECT COUNT(DISTINCT tx_hash) AS total FROM fhe_events WHERE chain_id = $chainId")
-    .get({ $chainId: chainId }) as { total: number };
+  const dfgRow = rollupRow
+    ? {
+        total: rollupRow.total ?? 0,
+        avgNodes: rollupRow.avgNodes ?? null,
+        avgEdges: rollupRow.avgEdges ?? null,
+        avgDepth: rollupRow.avgDepth ?? null,
+        minNodes: rollupRow.minNodes ?? null,
+        maxNodes: rollupRow.maxNodes ?? null,
+        minEdges: rollupRow.minEdges ?? null,
+        maxEdges: rollupRow.maxEdges ?? null,
+        minDepth: rollupRow.minDepth ?? null,
+        maxDepth: rollupRow.maxDepth ?? null,
+        signatureCount: rollupRow.signatureCount ?? 0,
+      }
+    : (db
+        .prepare(
+          `SELECT COUNT(*) AS total,
+                  AVG(node_count) AS avgNodes,
+                  AVG(edge_count) AS avgEdges,
+                  AVG(depth) AS avgDepth,
+                  MIN(node_count) AS minNodes,
+                  MAX(node_count) AS maxNodes,
+                  MIN(edge_count) AS minEdges,
+                  MAX(edge_count) AS maxEdges,
+                  MIN(depth) AS minDepth,
+                  MAX(depth) AS maxDepth,
+                  COUNT(DISTINCT signature_hash) AS signatureCount
+           FROM dfg_txs
+           WHERE chain_id = $chainId`,
+        )
+        .get({ $chainId: chainId }) as {
+        total: number;
+        avgNodes: number | null;
+        avgEdges: number | null;
+        avgDepth: number | null;
+        minNodes: number | null;
+        maxNodes: number | null;
+        minEdges: number | null;
+        maxEdges: number | null;
+        minDepth: number | null;
+        maxDepth: number | null;
+        signatureCount: number;
+      });
 
-  const coverage = txRow.total > 0 ? dfgRow.total / txRow.total : 0;
+  let totalTxs: number | null = rollupRow?.eventTxCount ?? null;
+  if (totalTxs === null && hasTable("tx_counts")) {
+    const txCountRow = db
+      .prepare("SELECT count FROM tx_counts WHERE chain_id = $chainId")
+      .get({ $chainId: chainId }) as { count: number } | undefined;
+    totalTxs = txCountRow?.count ?? null;
+  }
+  if (totalTxs === null && hasTable("tx_seen")) {
+    const txSeenRow = db
+      .prepare("SELECT COUNT(*) AS count FROM tx_seen WHERE chain_id = $chainId")
+      .get({ $chainId: chainId }) as { count: number } | undefined;
+    totalTxs = txSeenRow?.count ?? null;
+  }
+  if (totalTxs === null) {
+    const txRow = db
+      .prepare("SELECT COUNT(DISTINCT tx_hash) AS total FROM fhe_events WHERE chain_id = $chainId")
+      .get({ $chainId: chainId }) as { total: number };
+    totalTxs = txRow.total;
+  }
+
+  const coverage = totalTxs > 0 ? dfgRow.total / totalTxs : 0;
 
   let deps: DepStats | null = null;
   const useBlockRange = startBlock !== undefined && endBlock !== undefined;
+  const shouldComputeDeps = includeDeps || useBlockRange || Boolean(signatureHash);
 
-  // When block range is provided (and optionally signatureHash), query dfg_tx_deps directly
-  if (useBlockRange && hasTable("dfg_tx_deps")) {
-    const depClauses = [
-      "d.chain_id = $chainId",
-      "d.block_number >= $startBlock",
-      "d.block_number <= $endBlock",
-    ];
-    const depParams: Record<string, string | number> = {
-      $chainId: chainId,
-      $startBlock: startBlock,
-      $endBlock: endBlock,
-    };
-    let depFromClause = "FROM dfg_tx_deps d";
+  if (shouldComputeDeps) {
+    // When block range is provided (and optionally signatureHash), query dfg_tx_deps directly
+    if (useBlockRange && hasTable("dfg_tx_deps")) {
+      const depClauses = [
+        "d.chain_id = $chainId",
+        "d.block_number >= $startBlock",
+        "d.block_number <= $endBlock",
+      ];
+      const depParams: Record<string, string | number> = {
+        $chainId: chainId,
+        $startBlock: startBlock,
+        $endBlock: endBlock,
+      };
+      let depFromClause = "FROM dfg_tx_deps d";
 
-    if (signatureHash) {
-      depFromClause =
-        "FROM dfg_tx_deps d JOIN dfg_txs t ON t.chain_id = d.chain_id AND t.tx_hash = d.tx_hash";
-      depClauses.push("t.signature_hash = $signatureHash");
-      depParams.$signatureHash = signatureHash;
-    }
+      if (signatureHash) {
+        depFromClause =
+          "FROM dfg_tx_deps d JOIN dfg_txs t ON t.chain_id = d.chain_id AND t.tx_hash = d.tx_hash";
+        depClauses.push("t.signature_hash = $signatureHash");
+        depParams.$signatureHash = signatureHash;
+      }
 
-    const depRow = db
-      .prepare(
-        `SELECT
+      const depRow = db
+        .prepare(
+          `SELECT
            COUNT(*) AS totalTxs,
            SUM(CASE WHEN d.upstream_txs > 0 THEN 1 ELSE 0 END) AS dependentTxs,
            SUM(CASE WHEN d.upstream_txs > 0 THEN d.upstream_txs ELSE 0 END) AS sumUpstreamTxs,
@@ -939,112 +1007,112 @@ function handleDfgStats(url: URL): Response {
            MAX(d.total_depth) AS maxTotalDepth
          ${depFromClause}
          WHERE ${depClauses.join(" AND ")}`,
-      )
-      .get(depParams) as {
-      totalTxs: number;
-      dependentTxs: number;
-      sumUpstreamTxs: number;
-      sumUpstreamHandles: number;
-      maxUpstreamTxs: number | null;
-      maxUpstreamHandles: number | null;
-      maxChainDepth: number | null;
-      maxTotalDepth: number | null;
-    };
+        )
+        .get(depParams) as {
+        totalTxs: number;
+        dependentTxs: number;
+        sumUpstreamTxs: number;
+        sumUpstreamHandles: number;
+        maxUpstreamTxs: number | null;
+        maxUpstreamHandles: number | null;
+        maxChainDepth: number | null;
+        maxTotalDepth: number | null;
+      };
 
-    // Get chain depth distribution for block range
-    const chainDistRows = db
-      .prepare(
-        `SELECT d.chain_depth AS depth, COUNT(*) AS count
+      // Get chain depth distribution for block range
+      const chainDistRows = db
+        .prepare(
+          `SELECT d.chain_depth AS depth, COUNT(*) AS count
          ${depFromClause}
          WHERE ${depClauses.join(" AND ")}
          GROUP BY d.chain_depth`,
-      )
-      .all(depParams) as Array<{
-      depth: number;
-      count: number;
-    }>;
+        )
+        .all(depParams) as Array<{
+        depth: number;
+        count: number;
+      }>;
 
-    // Get total depth distribution for block range
-    const totalDistRows = db
-      .prepare(
-        `SELECT d.total_depth AS depth, COUNT(*) AS count
+      // Get total depth distribution for block range
+      const totalDistRows = db
+        .prepare(
+          `SELECT d.total_depth AS depth, COUNT(*) AS count
          ${depFromClause}
          WHERE ${depClauses.join(" AND ")}
          GROUP BY d.total_depth`,
-      )
-      .all(depParams) as Array<{
-      depth: number;
-      count: number;
-    }>;
+        )
+        .all(depParams) as Array<{
+        depth: number;
+        count: number;
+      }>;
 
-    const chainDepthDistribution: Record<number, number> = {};
-    for (const row of chainDistRows) {
-      chainDepthDistribution[row.depth] = row.count;
-    }
+      const chainDepthDistribution: Record<number, number> = {};
+      for (const row of chainDistRows) {
+        chainDepthDistribution[row.depth] = row.count;
+      }
 
-    const totalDepthDistribution: Record<number, number> = {};
-    for (const row of totalDistRows) {
-      totalDepthDistribution[row.depth] = row.count;
-    }
+      const totalDepthDistribution: Record<number, number> = {};
+      for (const row of totalDistRows) {
+        totalDepthDistribution[row.depth] = row.count;
+      }
 
-    const totalTxs = depRow?.totalTxs ?? 0;
-    const dependentTxs = depRow?.dependentTxs ?? 0;
-    const independentTxs = Math.max(totalTxs - dependentTxs, 0);
-    const avgUpstreamTxs = dependentTxs > 0 ? (depRow?.sumUpstreamTxs ?? 0) / dependentTxs : 0;
-    const avgUpstreamHandles =
-      dependentTxs > 0 ? (depRow?.sumUpstreamHandles ?? 0) / dependentTxs : 0;
-    const parallelismRatio = totalTxs > 0 ? independentTxs / totalTxs : 0;
+      const totalTxs = depRow?.totalTxs ?? 0;
+      const dependentTxs = depRow?.dependentTxs ?? 0;
+      const independentTxs = Math.max(totalTxs - dependentTxs, 0);
+      const avgUpstreamTxs = dependentTxs > 0 ? (depRow?.sumUpstreamTxs ?? 0) / dependentTxs : 0;
+      const avgUpstreamHandles =
+        dependentTxs > 0 ? (depRow?.sumUpstreamHandles ?? 0) / dependentTxs : 0;
+      const parallelismRatio = totalTxs > 0 ? independentTxs / totalTxs : 0;
 
-    deps = {
-      totalTxs,
-      dependentTxs,
-      independentTxs,
-      avgUpstreamTxs,
-      avgUpstreamHandles,
-      maxUpstreamTxs: depRow?.maxUpstreamTxs ?? 0,
-      maxUpstreamHandles: depRow?.maxUpstreamHandles ?? 0,
-      parallelismRatio,
-      maxChainDepth: depRow?.maxChainDepth ?? 0,
-      maxTotalDepth: depRow?.maxTotalDepth ?? 0,
-      chainDepthDistribution,
-      totalDepthDistribution,
-      depthMode,
-      horizon: {
-        startBlock,
-        endBlock,
-        blockCount: endBlock - startBlock + 1,
-      },
-    };
-  } else if (!signatureHash && hasTable("dfg_dep_rollups")) {
-    // Use rollup data when no block range specified
-    const depsRow = db
-      .prepare(
-        `SELECT stats_json AS statsJson
+      deps = {
+        totalTxs,
+        dependentTxs,
+        independentTxs,
+        avgUpstreamTxs,
+        avgUpstreamHandles,
+        maxUpstreamTxs: depRow?.maxUpstreamTxs ?? 0,
+        maxUpstreamHandles: depRow?.maxUpstreamHandles ?? 0,
+        parallelismRatio,
+        maxChainDepth: depRow?.maxChainDepth ?? 0,
+        maxTotalDepth: depRow?.maxTotalDepth ?? 0,
+        chainDepthDistribution,
+        totalDepthDistribution,
+        depthMode,
+        horizon: {
+          startBlock,
+          endBlock,
+          blockCount: endBlock - startBlock + 1,
+        },
+      };
+    } else if (!signatureHash && hasTable("dfg_dep_rollups")) {
+      // Use rollup data when no block range specified
+      const depsRow = db
+        .prepare(
+          `SELECT stats_json AS statsJson
          FROM dfg_dep_rollups
          WHERE chain_id = $chainId`,
-      )
-      .get({ $chainId: chainId }) as { statsJson: string } | undefined;
-    deps = depsRow ? normalizeDepStats(parseJson(depsRow.statsJson)) : null;
-    if (deps) {
-      deps.depthMode = depthMode;
-    }
-  }
-
-  if (!deps && includeDeps && hasTable("dfg_tx_deps")) {
-    const depClauses = ["d.chain_id = $chainId"];
-    const depParams: Record<string, string | number> = { $chainId: chainId };
-    let depFromClause = "FROM dfg_tx_deps d";
-
-    if (signatureHash) {
-      depFromClause =
-        "FROM dfg_tx_deps d JOIN dfg_txs t ON t.chain_id = d.chain_id AND t.tx_hash = d.tx_hash";
-      depClauses.push("t.signature_hash = $signatureHash");
-      depParams.$signatureHash = signatureHash;
+        )
+        .get({ $chainId: chainId }) as { statsJson: string } | undefined;
+      deps = depsRow ? normalizeDepStats(parseJson(depsRow.statsJson)) : null;
+      if (deps) {
+        deps.depthMode = depthMode;
+      }
     }
 
-    const depRow = db
-      .prepare(
-        `SELECT
+    if (!deps && includeDeps && hasTable("dfg_tx_deps")) {
+      const depClauses = ["d.chain_id = $chainId"];
+      const depParams: Record<string, string | number> = { $chainId: chainId };
+      let depFromClause = "FROM dfg_tx_deps d";
+
+      if (signatureHash) {
+        depFromClause =
+          "FROM dfg_tx_deps d JOIN dfg_txs t ON t.chain_id = d.chain_id AND t.tx_hash = d.tx_hash";
+        depClauses.push("t.signature_hash = $signatureHash");
+        depParams.$signatureHash = signatureHash;
+      }
+
+      const depRow = db
+        .prepare(
+          `SELECT
            COUNT(*) AS totalTxs,
            SUM(CASE WHEN d.upstream_txs > 0 THEN 1 ELSE 0 END) AS dependentTxs,
            SUM(CASE WHEN d.upstream_txs > 0 THEN d.upstream_txs ELSE 0 END) AS sumUpstreamTxs,
@@ -1055,76 +1123,76 @@ function handleDfgStats(url: URL): Response {
            MAX(d.total_depth) AS maxTotalDepth
          ${depFromClause}
          WHERE ${depClauses.join(" AND ")}`,
-      )
-      .get(depParams) as {
-      totalTxs: number;
-      dependentTxs: number;
-      sumUpstreamTxs: number;
-      sumUpstreamHandles: number;
-      maxUpstreamTxs: number | null;
-      maxUpstreamHandles: number | null;
-      maxChainDepth: number | null;
-      maxTotalDepth: number | null;
-    };
+        )
+        .get(depParams) as {
+        totalTxs: number;
+        dependentTxs: number;
+        sumUpstreamTxs: number;
+        sumUpstreamHandles: number;
+        maxUpstreamTxs: number | null;
+        maxUpstreamHandles: number | null;
+        maxChainDepth: number | null;
+        maxTotalDepth: number | null;
+      };
 
-    // Get distributions
-    const chainDistRows = db
-      .prepare(
-        `SELECT d.chain_depth AS depth, COUNT(*) AS count
+      // Get distributions
+      const chainDistRows = db
+        .prepare(
+          `SELECT d.chain_depth AS depth, COUNT(*) AS count
          ${depFromClause}
          WHERE ${depClauses.join(" AND ")}
          GROUP BY d.chain_depth`,
-      )
-      .all(depParams) as Array<{ depth: number; count: number }>;
+        )
+        .all(depParams) as Array<{ depth: number; count: number }>;
 
-    const totalDistRows = db
-      .prepare(
-        `SELECT d.total_depth AS depth, COUNT(*) AS count
+      const totalDistRows = db
+        .prepare(
+          `SELECT d.total_depth AS depth, COUNT(*) AS count
          ${depFromClause}
          WHERE ${depClauses.join(" AND ")}
          GROUP BY d.total_depth`,
-      )
-      .all(depParams) as Array<{ depth: number; count: number }>;
+        )
+        .all(depParams) as Array<{ depth: number; count: number }>;
 
-    const chainDepthDistribution: Record<number, number> = {};
-    for (const row of chainDistRows) {
-      chainDepthDistribution[row.depth] = row.count;
+      const chainDepthDistribution: Record<number, number> = {};
+      for (const row of chainDistRows) {
+        chainDepthDistribution[row.depth] = row.count;
+      }
+
+      const totalDepthDistribution: Record<number, number> = {};
+      for (const row of totalDistRows) {
+        totalDepthDistribution[row.depth] = row.count;
+      }
+
+      const totalTxs = depRow?.totalTxs ?? 0;
+      const dependentTxs = depRow?.dependentTxs ?? 0;
+      const independentTxs = Math.max(totalTxs - dependentTxs, 0);
+      const avgUpstreamTxs = dependentTxs > 0 ? (depRow?.sumUpstreamTxs ?? 0) / dependentTxs : 0;
+      const avgUpstreamHandles =
+        dependentTxs > 0 ? (depRow?.sumUpstreamHandles ?? 0) / dependentTxs : 0;
+      const parallelismRatio = totalTxs > 0 ? independentTxs / totalTxs : 0;
+
+      deps = {
+        totalTxs,
+        dependentTxs,
+        independentTxs,
+        avgUpstreamTxs,
+        avgUpstreamHandles,
+        maxUpstreamTxs: depRow?.maxUpstreamTxs ?? 0,
+        maxUpstreamHandles: depRow?.maxUpstreamHandles ?? 0,
+        parallelismRatio,
+        maxChainDepth: depRow?.maxChainDepth ?? 0,
+        maxTotalDepth: depRow?.maxTotalDepth ?? 0,
+        chainDepthDistribution,
+        totalDepthDistribution,
+        depthMode,
+      };
     }
 
-    const totalDepthDistribution: Record<number, number> = {};
-    for (const row of totalDistRows) {
-      totalDepthDistribution[row.depth] = row.count;
-    }
-
-    const totalTxs = depRow?.totalTxs ?? 0;
-    const dependentTxs = depRow?.dependentTxs ?? 0;
-    const independentTxs = Math.max(totalTxs - dependentTxs, 0);
-    const avgUpstreamTxs = dependentTxs > 0 ? (depRow?.sumUpstreamTxs ?? 0) / dependentTxs : 0;
-    const avgUpstreamHandles =
-      dependentTxs > 0 ? (depRow?.sumUpstreamHandles ?? 0) / dependentTxs : 0;
-    const parallelismRatio = totalTxs > 0 ? independentTxs / totalTxs : 0;
-
-    deps = {
-      totalTxs,
-      dependentTxs,
-      independentTxs,
-      avgUpstreamTxs,
-      avgUpstreamHandles,
-      maxUpstreamTxs: depRow?.maxUpstreamTxs ?? 0,
-      maxUpstreamHandles: depRow?.maxUpstreamHandles ?? 0,
-      parallelismRatio,
-      maxChainDepth: depRow?.maxChainDepth ?? 0,
-      maxTotalDepth: depRow?.maxTotalDepth ?? 0,
-      chainDepthDistribution,
-      totalDepthDistribution,
-      depthMode,
-    };
-  }
-
-  if (!deps && includeDeps && hasTable("dfg_nodes") && hasTable("dfg_inputs")) {
-    const depRow = db
-      .prepare(
-        `WITH produced AS (
+    if (!deps && includeDeps && hasTable("dfg_nodes") && hasTable("dfg_inputs")) {
+      const depRow = db
+        .prepare(
+          `WITH produced AS (
            SELECT n.output_handle AS handle,
                   n.tx_hash AS producer_tx,
                   t.block_number AS producer_block
@@ -1164,42 +1232,43 @@ function handleDfgStats(url: URL): Response {
            (SELECT COALESCE(AVG(handleLinks), 0) FROM per_tx) AS avgUpstreamHandles,
            (SELECT COALESCE(MAX(upstreamTxs), 0) FROM per_tx) AS maxUpstreamTxs,
            (SELECT COALESCE(MAX(handleLinks), 0) FROM per_tx) AS maxUpstreamHandles`,
-      )
-      .get({ $chainId: chainId }) as {
-      totalTxs: number;
-      dependentTxs: number;
-      avgUpstreamTxs: number | null;
-      avgUpstreamHandles: number | null;
-      maxUpstreamTxs: number | null;
-      maxUpstreamHandles: number | null;
-    };
-
-    if (depRow) {
-      const totalTxs = depRow.totalTxs ?? 0;
-      const dependentTxs = depRow.dependentTxs ?? 0;
-      const independentTxs = Math.max(totalTxs - dependentTxs, 0);
-      const parallelismRatio = totalTxs > 0 ? independentTxs / totalTxs : 0;
-      deps = {
-        totalTxs,
-        dependentTxs,
-        independentTxs,
-        avgUpstreamTxs: depRow.avgUpstreamTxs ?? 0,
-        avgUpstreamHandles: depRow.avgUpstreamHandles ?? 0,
-        maxUpstreamTxs: depRow.maxUpstreamTxs ?? 0,
-        maxUpstreamHandles: depRow.maxUpstreamHandles ?? 0,
-        parallelismRatio,
-        maxChainDepth: 0, // Unavailable in legacy fallback
-        maxTotalDepth: 0, // Unavailable in legacy fallback
-        chainDepthDistribution: {}, // Unavailable in legacy fallback
-        totalDepthDistribution: {}, // Unavailable in legacy fallback
-        depthMode,
+        )
+        .get({ $chainId: chainId }) as {
+        totalTxs: number;
+        dependentTxs: number;
+        avgUpstreamTxs: number | null;
+        avgUpstreamHandles: number | null;
+        maxUpstreamTxs: number | null;
+        maxUpstreamHandles: number | null;
       };
+
+      if (depRow) {
+        const totalTxs = depRow.totalTxs ?? 0;
+        const dependentTxs = depRow.dependentTxs ?? 0;
+        const independentTxs = Math.max(totalTxs - dependentTxs, 0);
+        const parallelismRatio = totalTxs > 0 ? independentTxs / totalTxs : 0;
+        deps = {
+          totalTxs,
+          dependentTxs,
+          independentTxs,
+          avgUpstreamTxs: depRow.avgUpstreamTxs ?? 0,
+          avgUpstreamHandles: depRow.avgUpstreamHandles ?? 0,
+          maxUpstreamTxs: depRow.maxUpstreamTxs ?? 0,
+          maxUpstreamHandles: depRow.maxUpstreamHandles ?? 0,
+          parallelismRatio,
+          maxChainDepth: 0, // Unavailable in legacy fallback
+          maxTotalDepth: 0, // Unavailable in legacy fallback
+          chainDepthDistribution: {}, // Unavailable in legacy fallback
+          totalDepthDistribution: {}, // Unavailable in legacy fallback
+          depthMode,
+        };
+      }
     }
   }
 
   // Get max block with dependency data for horizon filtering
   let maxDepsBlock: number | null = null;
-  if (hasTable("dfg_tx_deps")) {
+  if (includeDeps && hasTable("dfg_tx_deps")) {
     const maxBlockRow = db
       .prepare("SELECT MAX(block_number) AS maxBlock FROM dfg_tx_deps WHERE chain_id = $chainId")
       .get({ $chainId: chainId }) as { maxBlock: number | null } | undefined;
@@ -1209,7 +1278,7 @@ function handleDfgStats(url: URL): Response {
   return jsonResponse({
     chainId,
     dfg: dfgRow,
-    totalTxs: txRow.total,
+    totalTxs: totalTxs ?? 0,
     coverage,
     deps,
     maxDepsBlock,

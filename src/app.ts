@@ -318,6 +318,19 @@ export function initDatabase(dbPath: string): Database {
     CREATE INDEX IF NOT EXISTS tx_callers_by_caller
       ON tx_callers(chain_id, caller, tx_hash);
 
+    CREATE TABLE IF NOT EXISTS tx_seen (
+      chain_id INTEGER NOT NULL,
+      tx_hash TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (chain_id, tx_hash)
+    );
+
+    CREATE TABLE IF NOT EXISTS tx_counts (
+      chain_id INTEGER PRIMARY KEY,
+      count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS checkpoints (
       chain_id INTEGER PRIMARY KEY,
       last_block INTEGER NOT NULL,
@@ -344,6 +357,24 @@ export function initDatabase(dbPath: string): Database {
     CREATE TABLE IF NOT EXISTS rollup_checkpoints (
       chain_id INTEGER PRIMARY KEY,
       last_block INTEGER NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS dfg_stats_rollups (
+      chain_id INTEGER PRIMARY KEY,
+      total INTEGER NOT NULL DEFAULT 0,
+      avg_nodes REAL,
+      avg_edges REAL,
+      avg_depth REAL,
+      min_nodes INTEGER,
+      max_nodes INTEGER,
+      min_edges INTEGER,
+      max_edges INTEGER,
+      min_depth INTEGER,
+      max_depth INTEGER,
+      signature_count INTEGER,
+      event_tx_count INTEGER,
+      max_block INTEGER,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -550,6 +581,25 @@ function prepareStatements(db: Database) {
     VALUES (?, ?, ?)
   `);
 
+  const insertTxSeen = db.prepare(`
+    INSERT OR IGNORE INTO tx_seen (
+      chain_id,
+      tx_hash
+    )
+    VALUES (?, ?)
+  `);
+
+  const upsertTxCount = db.prepare(`
+    INSERT INTO tx_counts (
+      chain_id,
+      count
+    )
+    VALUES (?, 1)
+    ON CONFLICT(chain_id) DO UPDATE
+      SET count = count + 1,
+          updated_at = datetime('now')
+  `);
+
   const upsertOpCount = db.prepare(`
     INSERT INTO op_counts (
       chain_id,
@@ -574,7 +624,15 @@ function prepareStatements(db: Database) {
           updated_at = datetime('now')
   `);
 
-  return { insertEvent, insertTxCaller, upsertOpCount, getCheckpoint, upsertCheckpoint };
+  return {
+    insertEvent,
+    insertTxCaller,
+    insertTxSeen,
+    upsertTxCount,
+    upsertOpCount,
+    getCheckpoint,
+    upsertCheckpoint,
+  };
 }
 
 function readCheckpoint(
@@ -907,10 +965,13 @@ async function processRange(
 
     if (insertResult.changes) {
       statements.upsertOpCount.run(chainId, eventName);
-    }
-
-    if (callerLower) {
-      statements.insertTxCaller.run(chainId, log.transactionHash, callerLower);
+      const txSeenResult = statements.insertTxSeen.run(chainId, log.transactionHash);
+      if (txSeenResult.changes) {
+        statements.upsertTxCount.run(chainId);
+      }
+      if (callerLower) {
+        statements.insertTxCaller.run(chainId, log.transactionHash, callerLower);
+      }
     }
   }
 
