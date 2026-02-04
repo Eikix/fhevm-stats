@@ -275,6 +275,35 @@ function handleOps(url: URL): Response {
 
 function handleSummary(url: URL): Response {
   const filters = parseFilters(url);
+  const canUseCounts =
+    filters.chainId !== undefined &&
+    filters.startBlock === undefined &&
+    filters.endBlock === undefined &&
+    filters.eventName === undefined &&
+    hasTable("op_counts") &&
+    hasTable("checkpoints");
+
+  if (canUseCounts) {
+    const countRow = db
+      .prepare("SELECT COALESCE(SUM(count), 0) AS count FROM op_counts WHERE chain_id = $chainId")
+      .get({ $chainId: filters.chainId }) as { count: number };
+    const minRow = db
+      .prepare("SELECT MIN(block_number) AS minBlock FROM fhe_events WHERE chain_id = $chainId")
+      .get({ $chainId: filters.chainId }) as { minBlock: number | null };
+    const maxRow = db
+      .prepare("SELECT last_block AS maxBlock FROM checkpoints WHERE chain_id = $chainId")
+      .get({ $chainId: filters.chainId }) as { maxBlock: number | null } | undefined;
+
+    return jsonResponse({
+      filters,
+      summary: {
+        count: countRow.count ?? 0,
+        minBlock: minRow.minBlock ?? null,
+        maxBlock: maxRow?.maxBlock ?? null,
+      },
+    });
+  }
+
   const { clause, params } = buildWhereClause(filters);
   const row = db
     .prepare(

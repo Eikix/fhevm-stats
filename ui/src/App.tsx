@@ -541,6 +541,7 @@ function App() {
     "idle" | "loading" | "ready" | "error"
   >("idle");
   const [dfgRollupError, setDfgRollupError] = useState<string | null>(null);
+  const [dfgFiltersKey, setDfgFiltersKey] = useState(0);
   const [dfgGraphView] = useState(true);
   const [dfgViewBox, setDfgViewBox] = useState<ViewBox | null>(null);
   const [dfgDragging, setDfgDragging] = useState(false);
@@ -620,7 +621,18 @@ function App() {
     setDfgSignatureSelection(null);
     setDfgSelection(null);
     setDfgQuery("");
+    setDfgFiltersKey(0);
   }, [chainId, dfgCaller]);
+
+  useEffect(() => {
+    if (!dfgCaller.trim() && dfgFiltersKey === 0) {
+      setDfgFiltersKey(1);
+    }
+  }, [dfgCaller, dfgFiltersKey]);
+
+  useEffect(() => {
+    setDfgFiltersKey(0);
+  }, [dfgRangeMode, dfgStartBlock, dfgEndBlock, windowLookback]);
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -709,8 +721,11 @@ function App() {
   }, [chainId, refreshKey, autoRefreshKey]);
 
   useEffect(() => {
+    const canLoad = status === "ready" && opsStatus === "ready";
+    if (!canLoad) return;
+
     const controller = new AbortController();
-    const cacheBust = refreshKey;
+    const cacheBust = 0;
     const params = new URLSearchParams();
     params.set("chainId", chainId.toString());
     params.set("role", opTypeRole);
@@ -748,11 +763,12 @@ function App() {
 
     load();
     return () => controller.abort();
-  }, [chainId, refreshKey, opTypeRole]);
+  }, [chainId, opTypeRole, status, opsStatus]);
 
   useEffect(() => {
+    if (dfgFiltersKey === 0) return;
     const controller = new AbortController();
-    const cacheBust = refreshKey;
+    const cacheBust = dfgFiltersKey;
     const params = new URLSearchParams();
     params.set("chainId", chainId.toString());
     params.set("limit", "16");
@@ -815,7 +831,7 @@ function App() {
     return () => controller.abort();
   }, [
     chainId,
-    refreshKey,
+    dfgFiltersKey,
     dfgSignatureSelection,
     dfgCaller,
     dfgRangeMode,
@@ -826,8 +842,9 @@ function App() {
   ]);
 
   useEffect(() => {
+    if (dfgFiltersKey === 0) return;
     const controller = new AbortController();
-    const cacheBust = refreshKey;
+    const cacheBust = dfgFiltersKey;
     const params = new URLSearchParams();
     params.set("chainId", chainId.toString());
     params.set("limit", "10");
@@ -884,7 +901,7 @@ function App() {
     return () => controller.abort();
   }, [
     chainId,
-    refreshKey,
+    dfgFiltersKey,
     dfgSignatureMinNodes,
     dfgSignatureMinEdges,
     dfgCaller,
@@ -936,7 +953,7 @@ function App() {
     params.set("chainId", chainId.toString());
     params.set("lookbackBlocks", windowLookback.toString());
     params.set("topLimit", "10");
-    params.set("cacheBust", refreshKey.toString());
+    params.set("cacheBust", windowLookback.toString());
 
     setWindowStatus("loading");
     setWindowError(null);
@@ -957,9 +974,11 @@ function App() {
       });
 
     return () => controller.abort();
-  }, [windowLookback, dfgStatsStatus, chainId, refreshKey]);
+  }, [windowLookback, dfgStatsStatus, chainId]);
 
   useEffect(() => {
+    if (dfgStatsStatus !== "ready") return;
+
     const controller = new AbortController();
     const cacheBust = refreshKey;
     const params = new URLSearchParams();
@@ -2466,6 +2485,13 @@ function App() {
                   className="rounded-full border border-black/10 bg-white/80 px-2 py-0.5 text-[9px] uppercase tracking-[0.2em] text-black/60 transition hover:bg-white"
                 >
                   clear
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDfgFiltersKey((value) => value + 1)}
+                  className="rounded-full border border-black/10 bg-black/80 px-2 py-0.5 text-[9px] uppercase tracking-[0.2em] text-white transition hover:bg-black"
+                >
+                  apply
                 </button>
               </div>
             </div>
