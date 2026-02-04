@@ -15,7 +15,9 @@
     "rollup:ops:all": "bun run scripts/rollup-ops-all.ts",
     "dfg:build": "bun run scripts/build-dfg.ts",
     "dfg:validate": "bun run scripts/validate-dfg.ts",
+    "dfg:validate:inputs": "bun run scripts/validate-dfg-inputs.ts",
     "dfg:rollup": "bun run scripts/rollup-dfg.ts",
+    "dfg:tx-cycles": "bun run scripts/dfg-tx-cycles.ts",
     "migrate": "bun run scripts/migrate.ts",
     "serve": "bun run src/server.ts",
     "share:ngrok": "scripts/share-ngrok.sh",
@@ -32,6 +34,7 @@
   "devDependencies": {
     "@biomejs/biome": "^2.3.11",
     "@types/bun": "latest",
+    "husky": "^9.1.7",
     "typescript": "^5.9.3"
   },
   "dependencies": {

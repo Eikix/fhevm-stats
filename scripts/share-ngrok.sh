@@ -49,6 +49,7 @@ require_cmd ngrok
 
 LIVE=false
 SKIP_ROLLUPS=false
+SKIP_OPS_ROLLUP=false
 INTERVAL="10m"
 FORCE=false
 DFG_INITIAL_DELAY_SECONDS=30
@@ -63,6 +64,7 @@ Options:
   --interval       Loop interval (seconds or with s/m/h suffix).
   --force          Skip safety checks for existing processes/ports.
   --skip-rollups   Skip periodic DFG + ops rollups in live mode.
+  --skip-ops-rollup Skip rollup:ops:all during the live loop.
 EOF
 }
 
@@ -110,6 +112,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-rollups)
       SKIP_ROLLUPS=true
+      shift
+      ;;
+    --skip-ops-rollup)
+      SKIP_OPS_ROLLUP=true
       shift
       ;;
     -h|--help)
@@ -276,8 +282,12 @@ run_build_rollup() {
       bun run dfg:build
       echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] dfg:rollup"
       bun run dfg:rollup
-      echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] rollup:ops:all"
-      bun run rollup:ops:all
+      if [ "$SKIP_OPS_ROLLUP" = true ]; then
+        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] skipping rollup:ops:all"
+      else
+        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] rollup:ops:all"
+        bun run rollup:ops:all
+      fi
       echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] resuming stream"
       rm -f "$STREAM_PAUSE_FILE"
     } >>"$LOG_DIR/dfg-loop.log" 2>&1 || {

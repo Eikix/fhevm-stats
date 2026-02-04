@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
 import { initDatabase } from "../src/app.ts";
+import { computeDfgSignature } from "../src/dfg-signature.ts";
 
 const DEFAULT_DB_PATH = "data/fhevm_stats.sqlite";
 
@@ -385,11 +385,10 @@ function buildDfg(events: EventRow[]) {
 }
 
 function computeSignature(nodes: DfgNode[], edges: DfgEdge[]): string {
-  const payload = {
-    ops: nodes.map((node) => node.op),
-    edges: edges.map((edge) => [edge.fromNodeId, edge.toNodeId]),
-  };
-  return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+  return computeDfgSignature(
+    nodes.map((node) => ({ nodeId: node.nodeId, op: node.op })),
+    edges.map((edge) => ({ fromNodeId: edge.fromNodeId, toNodeId: edge.toNodeId })),
+  );
 }
 
 const dbPath = Bun.env.DB_PATH ?? DEFAULT_DB_PATH;

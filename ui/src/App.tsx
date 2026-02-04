@@ -2,7 +2,6 @@ import dagre from "@dagrejs/dagre";
 import {
   type FormEvent,
   type MouseEvent,
-  type WheelEvent,
   useEffect,
   useMemo,
   useRef,
@@ -66,6 +65,7 @@ type DfgSignatureRow = {
 type DfgSignaturesResponse = {
   rows: DfgSignatureRow[];
   total?: number;
+  txTotal?: number;
 };
 
 type DfgStatsResponse = {
@@ -473,6 +473,7 @@ function App() {
   >(null);
   const [dfgSignatures, setDfgSignatures] = useState<DfgSignatureRow[]>([]);
   const [dfgSignatureTotal, setDfgSignatureTotal] = useState(0);
+  const [dfgSignatureTxTotal, setDfgSignatureTxTotal] = useState(0);
   const [dfgSignatureStatus, setDfgSignatureStatus] = useState<
     "idle" | "loading" | "ready" | "error"
   >("idle");
@@ -481,6 +482,15 @@ function App() {
   );
   const [dfgSignatureMinNodes, setDfgSignatureMinNodes] = useState(2);
   const [dfgSignatureMinEdges, setDfgSignatureMinEdges] = useState(1);
+  const [dfgCaller, setDfgCaller] = useState(() => {
+    try {
+      return localStorage.getItem("dfgCaller") ?? "";
+    } catch {
+      return "";
+    }
+  });
+  const defaultCallerAppliedRef = useRef(false);
+  const dfgResetRef = useRef<{ chainId: number; caller: string } | null>(null);
   const [dfgStats, setDfgStats] = useState<DfgStatsResponse | null>(null);
   const [dfgStatsStatus, setDfgStatsStatus] = useState<
     "idle" | "loading" | "ready" | "error"
@@ -527,6 +537,38 @@ function App() {
   const activeNetwork =
     NETWORKS.find((network) => network.id === networkId) ?? NETWORKS[0];
   const chainId = activeNetwork.chainId;
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("dfgCaller", dfgCaller);
+    } catch {
+      // ignore
+    }
+  }, [dfgCaller]);
+
+  useEffect(() => {
+    if (chainId !== 11155111) return;
+    if (defaultCallerAppliedRef.current) return;
+    defaultCallerAppliedRef.current = true;
+    try {
+      const stored = localStorage.getItem("dfgCaller");
+      if (!stored) {
+        setDfgCaller("0x9fdd4b67c241779dca4d2eaf3d5946fb699f5d7a");
+      }
+    } catch {
+      // ignore
+    }
+  }, [chainId]);
+
+  useEffect(() => {
+    const prev = dfgResetRef.current;
+    if (prev && prev.chainId === chainId && prev.caller === dfgCaller) return;
+    dfgResetRef.current = { chainId, caller: dfgCaller };
+
+    setDfgSignatureSelection(null);
+    setDfgSelection(null);
+    setDfgQuery("");
+  }, [chainId, dfgCaller]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -646,7 +688,17 @@ function App() {
     if (dfgSignatureSelection) {
       params.set("signatureHash", dfgSignatureSelection);
     }
+    if (dfgCaller.trim()) {
+      params.set("caller", dfgCaller.trim().toLowerCase());
+    }
     params.set("cacheBust", cacheBust.toString());
+
+    if (summary?.maxBlock != null) {
+      const endBlock = summary.maxBlock;
+      const startBlock = Math.max(0, endBlock - windowLookback + 1);
+      params.set("startBlock", startBlock.toString());
+      params.set("endBlock", endBlock.toString());
+    }
 
     const load = async () => {
       setDfgStatus("loading");
@@ -679,7 +731,14 @@ function App() {
 
     load();
     return () => controller.abort();
-  }, [chainId, refreshKey, dfgSignatureSelection]);
+  }, [
+    chainId,
+    refreshKey,
+    dfgSignatureSelection,
+    dfgCaller,
+    windowLookback,
+    summary?.maxBlock,
+  ]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -689,7 +748,18 @@ function App() {
     params.set("limit", "10");
     params.set("minNodes", dfgSignatureMinNodes.toString());
     params.set("minEdges", dfgSignatureMinEdges.toString());
+    if (dfgCaller.trim()) {
+      params.set("caller", dfgCaller.trim().toLowerCase());
+    }
     params.set("cacheBust", cacheBust.toString());
+
+    // Apply window-based block range filtering if we have block info
+    if (summary?.maxBlock != null) {
+      const endBlock = summary.maxBlock;
+      const startBlock = Math.max(0, endBlock - windowLookback + 1);
+      params.set("startBlock", startBlock.toString());
+      params.set("endBlock", endBlock.toString());
+    }
 
     const load = async () => {
       setDfgSignatureStatus("loading");
@@ -703,6 +773,7 @@ function App() {
         if (controller.signal.aborted) return;
         setDfgSignatures(response.rows ?? []);
         setDfgSignatureTotal(response.total ?? 0);
+        setDfgSignatureTxTotal(response.txTotal ?? 0);
         setDfgSignatureStatus("ready");
       } catch (err) {
         if (controller.signal.aborted) return;
@@ -715,7 +786,15 @@ function App() {
 
     load();
     return () => controller.abort();
-  }, [chainId, refreshKey, dfgSignatureMinNodes, dfgSignatureMinEdges]);
+  }, [
+    chainId,
+    refreshKey,
+    dfgSignatureMinNodes,
+    dfgSignatureMinEdges,
+    dfgCaller,
+    windowLookback,
+    summary?.maxBlock,
+  ]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1126,6 +1205,7 @@ function App() {
 
   // Attach non-passive wheel listener to prevent page scroll while zooming
   useEffect(() => {
+    if (!dfgGraph) return;
     const svg = dfgSvgRef.current;
     if (!svg) return;
 
@@ -1168,7 +1248,7 @@ function App() {
 
     svg.addEventListener("wheel", handleWheel, { passive: false });
     return () => svg.removeEventListener("wheel", handleWheel);
-  }, [dfgGraphView, dfgSelected]);
+  }, [dfgGraph]);
 
   const handleGraphMouseDown = (event: MouseEvent<SVGSVGElement>) => {
     if (!dfgViewBox) return;
@@ -1745,39 +1825,36 @@ function App() {
                     <div className="grid gap-4 md:grid-cols-5">
                       <div>
                         <p className="muted-text text-[10px] uppercase tracking-[0.2em]">
-                          Max combined
+                          Max Σtx_depth
                         </p>
                         <p className="font-code text-xl mt-1">
                           {formatNumber(windowStats.stats.maxCombinedDepth)}
                         </p>
                         <p className="text-[10px] text-black/50">
-                          inter + intra
+                          critical path
                         </p>
                       </div>
                       <div>
                         <p className="muted-text text-[10px] uppercase tracking-[0.2em]">
-                          Avg combined
+                          Avg Σtx_depth
                         </p>
                         <p className="font-code text-xl mt-1">
                           {formatDecimal(windowStats.stats.avgCombinedDepth, 1)}
                         </p>
                         <p className="text-[10px] text-black/50">
-                          {formatDecimal(
-                            windowStats.stats.avgTruncatedDepth,
-                            1,
-                          )}{" "}
-                          + {formatDecimal(windowStats.stats.avgIntraDepth, 1)}
+                          avg tx depth:{" "}
+                          {formatDecimal(windowStats.stats.avgIntraDepth, 1)}
                         </p>
                       </div>
                       <div>
                         <p className="muted-text text-[10px] uppercase tracking-[0.2em]">
-                          Max inter-tx
+                          Max chain
                         </p>
                         <p className="font-code text-xl mt-1">
                           {formatNumber(windowStats.stats.maxTruncatedDepth)}
                         </p>
                         <p className="text-[10px] text-black/50">
-                          cross-tx deps
+                          longest tx chain
                         </p>
                       </div>
                       <div>
@@ -1812,20 +1889,20 @@ function App() {
                     </div>
                   </div>
 
-                  {/* Combined depth distribution histogram */}
+                  {/* Σtx_depth distribution histogram */}
                   <div className="rounded-xl border border-black/5 bg-white p-4 mb-4">
                     <div className="flex items-center justify-between mb-3">
                       <p className="muted-text text-[10px] uppercase tracking-[0.2em]">
-                        Combined depth distribution
+                        Σtx_depth distribution
                       </p>
                       <div className="flex items-center gap-3 text-[9px]">
                         <span className="flex items-center gap-1">
                           <span className="w-2 h-2 rounded-sm bg-teal-600" />
-                          Inter-tx
+                          Upstream chain
                         </span>
                         <span className="flex items-center gap-1">
                           <span className="w-2 h-2 rounded-sm bg-teal-300" />
-                          Intra-tx
+                          This tx
                         </span>
                       </div>
                     </div>
@@ -1889,14 +1966,14 @@ function App() {
                                   className="flex-1 flex flex-col items-center justify-end"
                                 >
                                   <div className="w-full min-w-[4px] flex flex-col justify-end">
-                                    {/* Intra-tx (top, lighter) */}
+                                    {/* This tx's intra (top, lighter) */}
                                     {intraHeightPx > 0 && (
                                       <div
                                         className="w-full bg-teal-300 rounded-t"
                                         style={{ height: intraHeightPx }}
                                       />
                                     )}
-                                    {/* Inter-tx (bottom, darker) */}
+                                    {/* Upstream chain's intra (bottom, darker) */}
                                     {interHeightPx > 0 && (
                                       <div
                                         className={`w-full bg-teal-600 ${intraHeightPx === 0 ? "rounded-t" : ""}`}
@@ -1976,14 +2053,15 @@ function App() {
                             </button>
                             <div className="flex items-center gap-4 text-black/50">
                               <span>block {formatNumber(tx.blockNumber)}</span>
-                              <span className="font-mono">
-                                combined:{" "}
-                                <span className="text-teal-700">
+                              <span className="font-mono text-[10px]">
+                                Σtx_depth:{" "}
+                                <span className="text-teal-700 text-xs">
                                   {tx.combinedDepth}
                                 </span>
-                                <span className="text-[10px] text-black/40 ml-1">
-                                  ({tx.truncatedDepth}+{tx.intraTxDepth})
-                                </span>
+                                <span className="text-black/40 mx-2">•</span>
+                                chain: {tx.truncatedDepth} tx
+                                <span className="text-black/40 mx-2">•</span>
+                                this tx depth: {tx.intraTxDepth}
                               </span>
                             </div>
                           </div>
@@ -2194,6 +2272,30 @@ function App() {
                   }}
                   className="w-14 rounded-full border border-black/10 bg-white px-2 py-1 text-center text-[10px] uppercase tracking-[0.2em]"
                 />
+                <span className="hidden sm:inline">Caller</span>
+                <input
+                  value={dfgCaller}
+                  onChange={(event) => setDfgCaller(event.target.value)}
+                  placeholder="0x…"
+                  className="w-56 rounded-full border border-black/10 bg-white px-3 py-1 text-[10px] uppercase tracking-[0.2em]"
+                />
+                <button
+                  type="button"
+                  onClick={() =>
+                    setDfgCaller("0x9fdd4b67c241779dca4d2eaf3d5946fb699f5d7a")
+                  }
+                  className="rounded-full border border-black/10 bg-white/80 px-2 py-0.5 text-[9px] uppercase tracking-[0.2em] text-black/60 transition hover:bg-white"
+                  title="Preset: attacker entrypoint (args_json.caller)"
+                >
+                  preset
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setDfgCaller("")}
+                  className="rounded-full border border-black/10 bg-white/80 px-2 py-0.5 text-[9px] uppercase tracking-[0.2em] text-black/60 transition hover:bg-white"
+                >
+                  clear
+                </button>
               </div>
             </div>
           </div>
@@ -2224,7 +2326,10 @@ function App() {
                 </thead>
                 <tbody className="text-black/80">
                   {dfgSignatures.map((row, index) => {
-                    const baseTotal = dfgStats?.dfg.total ?? dfgTotal;
+                    const baseTotal =
+                      dfgSignatureTxTotal > 0
+                        ? dfgSignatureTxTotal
+                        : (dfgStats?.dfg.total ?? dfgTotal);
                     const share =
                       baseTotal > 0
                         ? formatPercent((row.txCount / baseTotal) * 100)

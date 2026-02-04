@@ -174,8 +174,39 @@ function handleOps(url: URL): Response {
   const filters = parseFilters(url);
   const chainId = filters.chainId;
   const canUseRollup =
-    chainId !== undefined && filters.startBlock === undefined && filters.endBlock === undefined;
+    chainId !== undefined &&
+    filters.startBlock === undefined &&
+    filters.endBlock === undefined &&
+    hasTable("op_buckets") &&
+    hasTable("rollup_checkpoints");
   if (canUseRollup) {
+    const maxBlockRow = db
+      .prepare("SELECT MAX(block_number) AS maxBlock FROM fhe_events WHERE chain_id = $chainId")
+      .get({ $chainId: chainId }) as { maxBlock: number | null } | undefined;
+    const checkpointRow = db
+      .prepare("SELECT last_block AS lastBlock FROM rollup_checkpoints WHERE chain_id = $chainId")
+      .get({ $chainId: chainId }) as { lastBlock: number | null } | undefined;
+
+    const maxBlock = maxBlockRow?.maxBlock ?? null;
+    const lastBlock = checkpointRow?.lastBlock ?? null;
+
+    // Only use rollups if they are up-to-date. Partial rollups are misleading.
+    const rollupComplete = maxBlock !== null && lastBlock !== null && lastBlock >= maxBlock;
+    if (!rollupComplete) {
+      const { clause, params } = buildWhereClause(filters);
+      const rows = db
+        .prepare(
+          `SELECT event_name AS eventName, COUNT(*) AS count
+           FROM fhe_events
+           ${clause}
+           GROUP BY event_name
+           ORDER BY count DESC`,
+        )
+        .all(params) as Array<{ eventName: string; count: number }>;
+
+      return jsonResponse({ filters, source: "raw", rows });
+    }
+
     const bucketRow = db
       .prepare(
         "SELECT MAX(bucket_seconds) AS bucketSeconds FROM op_buckets WHERE chain_id = $chainId",
@@ -431,6 +462,9 @@ function handleDfgTxs(url: URL): Response {
   const offset = parseNumber(url.searchParams.get("offset"), 0) ?? 0;
   const minNodes = parseNumber(url.searchParams.get("minNodes"));
   const signatureHash = url.searchParams.get("signatureHash") ?? undefined;
+  const caller = url.searchParams.get("caller") ?? undefined;
+  const startBlock = parseNumber(url.searchParams.get("startBlock"));
+  const endBlock = parseNumber(url.searchParams.get("endBlock"));
 
   const clauses = ["chain_id = $chainId"];
   const params: Record<string, string | number> = { $chainId: chainId };
@@ -442,6 +476,27 @@ function handleDfgTxs(url: URL): Response {
   if (signatureHash) {
     clauses.push("signature_hash = $signatureHash");
     params.$signatureHash = signatureHash;
+  }
+  if (startBlock !== undefined) {
+    clauses.push("block_number >= $startBlock");
+    params.$startBlock = startBlock;
+  }
+  if (endBlock !== undefined) {
+    clauses.push("block_number <= $endBlock");
+    params.$endBlock = endBlock;
+  }
+  if (caller) {
+    clauses.push(
+      `EXISTS (
+        SELECT 1
+        FROM fhe_events e
+        WHERE e.chain_id = dfg_txs.chain_id
+          AND e.tx_hash = dfg_txs.tx_hash
+          AND lower(json_extract(e.args_json, '$.caller')) = $callerLower
+        LIMIT 1
+      )`,
+    );
+    params.$callerLower = caller.toLowerCase();
   }
 
   const rows = db
@@ -487,7 +542,7 @@ function handleDfgTxs(url: URL): Response {
     .get(params) as { count: number };
 
   return jsonResponse({
-    filters: { chainId, minNodes, signatureHash },
+    filters: { chainId, minNodes, signatureHash, caller, startBlock, endBlock },
     limit,
     offset,
     rows: normalized,
@@ -585,7 +640,7 @@ function handleDfgTx(url: URL): Response {
     .all({ $chainId: chainId, $txHash: txHash }) as Array<{ handle: string; kind: string }>;
 
   // Compute cut edges if lookbackBlocks is specified
-  let cutEdges: Array<{
+  const cutEdges: Array<{
     handle: string;
     producerTxHash: string;
     producerBlock: number;
@@ -662,6 +717,48 @@ function handleDfgSignatures(url: URL): Response {
   const offset = parseNumber(url.searchParams.get("offset"), 0) ?? 0;
   const minNodes = parseNumber(url.searchParams.get("minNodes"), 1) ?? 1;
   const minEdges = parseNumber(url.searchParams.get("minEdges"), 0) ?? 0;
+  const startBlock = parseNumber(url.searchParams.get("startBlock"));
+  const endBlock = parseNumber(url.searchParams.get("endBlock"));
+  const caller = url.searchParams.get("caller") ?? undefined;
+
+  // Build WHERE clauses for optional block range filtering
+  const whereClauses = [
+    "chain_id = $chainId",
+    "signature_hash IS NOT NULL",
+    "node_count >= $minNodes",
+    "edge_count >= $minEdges",
+  ];
+  const params: Record<string, string | number> = {
+    $chainId: chainId,
+    $limit: limit,
+    $offset: offset,
+    $minNodes: minNodes,
+    $minEdges: minEdges,
+  };
+
+  if (startBlock !== undefined) {
+    whereClauses.push("block_number >= $startBlock");
+    params.$startBlock = startBlock;
+  }
+  if (endBlock !== undefined) {
+    whereClauses.push("block_number <= $endBlock");
+    params.$endBlock = endBlock;
+  }
+  if (caller) {
+    whereClauses.push(
+      `EXISTS (
+        SELECT 1
+        FROM fhe_events e
+        WHERE e.chain_id = dfg_txs.chain_id
+          AND e.tx_hash = dfg_txs.tx_hash
+          AND lower(json_extract(e.args_json, '$.caller')) = $callerLower
+        LIMIT 1
+      )`,
+    );
+    params.$callerLower = caller.toLowerCase();
+  }
+
+  const whereClause = whereClauses.join(" AND ");
 
   const rows = db
     .prepare(
@@ -670,40 +767,46 @@ function handleDfgSignatures(url: URL): Response {
               AVG(node_count) AS avgNodes,
               AVG(edge_count) AS avgEdges
        FROM dfg_txs
-       WHERE chain_id = $chainId AND signature_hash IS NOT NULL
-         AND node_count >= $minNodes AND edge_count >= $minEdges
+       WHERE ${whereClause}
        GROUP BY signature_hash
        ORDER BY txCount DESC
        LIMIT $limit OFFSET $offset`,
     )
-    .all({
-      $chainId: chainId,
-      $limit: limit,
-      $offset: offset,
-      $minNodes: minNodes,
-      $minEdges: minEdges,
-    }) as Array<{
+    .all(params) as Array<{
     signatureHash: string;
     txCount: number;
     avgNodes: number;
     avgEdges: number;
   }>;
 
+  // For total count, we don't need limit/offset
+  const countParams = { ...params };
+  delete countParams.$limit;
+  delete countParams.$offset;
+
   const totalRow = db
     .prepare(
       `SELECT COUNT(DISTINCT signature_hash) AS count
        FROM dfg_txs
-       WHERE chain_id = $chainId AND signature_hash IS NOT NULL
-         AND node_count >= $minNodes AND edge_count >= $minEdges`,
+       WHERE ${whereClause}`,
     )
-    .get({ $chainId: chainId, $minNodes: minNodes, $minEdges: minEdges }) as { count: number };
+    .get(countParams) as { count: number };
+
+  const txTotalRow = db
+    .prepare(
+      `SELECT COUNT(*) AS count
+       FROM dfg_txs
+       WHERE ${whereClause}`,
+    )
+    .get(countParams) as { count: number };
 
   return jsonResponse({
-    filters: { chainId, minNodes, minEdges },
+    filters: { chainId, minNodes, minEdges, startBlock, endBlock, caller },
     limit,
     offset,
     rows,
     total: totalRow.count,
+    txTotal: txTotalRow.count,
   });
 }
 
@@ -1202,15 +1305,17 @@ function handleDfgStatsHorizon(url: URL): Response {
       FROM chunks
       WHERE total_txs > 0`,
     )
-    .get(params) as {
-    sample_count: number;
-    avg_max_chain_depth: number | null;
-    avg_max_total_depth: number | null;
-    max_max_chain_depth: number | null;
-    max_max_total_depth: number | null;
-    avg_parallelism: number | null;
-    min_parallelism: number | null;
-  } | undefined;
+    .get(params) as
+    | {
+        sample_count: number;
+        avg_max_chain_depth: number | null;
+        avg_max_total_depth: number | null;
+        max_max_chain_depth: number | null;
+        max_max_total_depth: number | null;
+        avg_parallelism: number | null;
+        min_parallelism: number | null;
+      }
+    | undefined;
 
   return jsonResponse({
     chainId,
@@ -1261,16 +1366,18 @@ function handleDfgPattern(url: URL): Response {
       JOIN dfg_txs t ON t.chain_id = d.chain_id AND t.tx_hash = d.tx_hash
       WHERE d.chain_id = $chainId AND t.signature_hash = $signatureHash`,
     )
-    .get({ $chainId: chainId, $signatureHash: signatureHash }) as {
-    txCount: number;
-    dependentTxs: number;
-    avgChainDepth: number | null;
-    avgTotalDepth: number | null;
-    maxChainDepth: number | null;
-    maxTotalDepth: number | null;
-    avgUpstreamTxs: number | null;
-    maxUpstreamTxs: number | null;
-  } | undefined;
+    .get({ $chainId: chainId, $signatureHash: signatureHash }) as
+    | {
+        txCount: number;
+        dependentTxs: number;
+        avgChainDepth: number | null;
+        avgTotalDepth: number | null;
+        maxChainDepth: number | null;
+        maxTotalDepth: number | null;
+        avgUpstreamTxs: number | null;
+        maxUpstreamTxs: number | null;
+      }
+    | undefined;
 
   if (!statsRow || statsRow.txCount === 0) {
     return jsonResponse({ error: "pattern_not_found" }, 404);
@@ -1319,6 +1426,8 @@ function handleDfgStatsWindow(url: URL): Response {
   const lookbackBlocks = parseNumber(url.searchParams.get("lookbackBlocks"), 50) ?? 50;
   const signatureHash = url.searchParams.get("signatureHash") ?? undefined;
   const topLimit = parseNumber(url.searchParams.get("topLimit"), 10) ?? 10;
+  const startBlock = parseNumber(url.searchParams.get("startBlock"));
+  const endBlock = parseNumber(url.searchParams.get("endBlock"));
 
   if (chainId === undefined) {
     return jsonResponse({ error: "chain_id_required" }, 400);
@@ -1327,27 +1436,30 @@ function handleDfgStatsWindow(url: URL): Response {
     return jsonResponse({ error: "dfg_tables_missing" }, 404);
   }
 
-  // Get all transactions with their blocks and intra-tx depth
+  // Get transactions with their blocks and intra-tx depth (with optional block range filtering)
   const txClauses = ["t.chain_id = $chainId"];
   const txParams: Record<string, string | number> = { $chainId: chainId };
-  let txQuery = `
+
+  if (startBlock !== undefined) {
+    txClauses.push("t.block_number >= $startBlock");
+    txParams.$startBlock = startBlock;
+  }
+  if (endBlock !== undefined) {
+    txClauses.push("t.block_number <= $endBlock");
+    txParams.$endBlock = endBlock;
+  }
+  if (signatureHash) {
+    txClauses.push("t.signature_hash = $signatureHash");
+    txParams.$signatureHash = signatureHash;
+  }
+
+  const txQuery = `
     SELECT t.tx_hash AS txHash, t.block_number AS blockNumber,
            t.depth AS intraTxDepth, d.chain_depth AS fullChainDepth
     FROM dfg_txs t
     LEFT JOIN dfg_tx_deps d ON d.chain_id = t.chain_id AND d.tx_hash = t.tx_hash
     WHERE ${txClauses.join(" AND ")}
   `;
-
-  if (signatureHash) {
-    txQuery = `
-      SELECT t.tx_hash AS txHash, t.block_number AS blockNumber,
-             t.depth AS intraTxDepth, d.chain_depth AS fullChainDepth
-      FROM dfg_txs t
-      LEFT JOIN dfg_tx_deps d ON d.chain_id = t.chain_id AND d.tx_hash = t.tx_hash
-      WHERE t.chain_id = $chainId AND t.signature_hash = $signatureHash
-    `;
-    txParams.$signatureHash = signatureHash;
-  }
 
   const txRows = db.prepare(txQuery).all(txParams) as Array<{
     txHash: string;
@@ -1361,6 +1473,8 @@ function handleDfgStatsWindow(url: URL): Response {
       chainId,
       lookbackBlocks,
       signatureHash,
+      startBlock,
+      endBlock,
       stats: {
         totalTxs: 0,
         dependentTxs: 0,
@@ -1374,29 +1488,46 @@ function handleDfgStatsWindow(url: URL): Response {
     });
   }
 
-  // Build tx block lookup
+  // Build tx block lookup and compute block range
   const txBlockMap = new Map<string, number>();
+  let minBlock = Infinity;
+  let maxBlock = -Infinity;
   for (const row of txRows) {
     txBlockMap.set(row.txHash, row.blockNumber);
+    minBlock = Math.min(minBlock, row.blockNumber);
+    maxBlock = Math.max(maxBlock, row.blockNumber);
   }
 
-  // Get external inputs for all txs
+  // Compute the earliest block we need for dependency lookback
+  const earliestNeededBlock = minBlock - lookbackBlocks;
+
+  // Get external inputs for txs in range (join with txs to filter)
   const inputRows = db
     .prepare(
       `SELECT i.tx_hash AS consumerTxHash, i.handle
        FROM dfg_inputs i
-       WHERE i.chain_id = $chainId AND i.kind = 'external'`,
+       INNER JOIN dfg_txs t ON t.chain_id = i.chain_id AND t.tx_hash = i.tx_hash
+       WHERE i.chain_id = $chainId AND i.kind = 'external'
+         AND t.block_number >= $minBlock AND t.block_number <= $maxBlock`,
     )
-    .all({ $chainId: chainId }) as Array<{ consumerTxHash: string; handle: string }>;
+    .all({ $chainId: chainId, $minBlock: minBlock, $maxBlock: maxBlock }) as Array<{
+    consumerTxHash: string;
+    handle: string;
+  }>;
 
-  // Get handle producers (non-trivial only for dependency calculation)
+  // Get handle producers within relevant block range (non-trivial only)
   const producerRows = db
     .prepare(
       `SELECT handle, tx_hash AS producerTxHash, block_number AS producerBlock
        FROM dfg_handle_producers
-       WHERE chain_id = $chainId AND is_trivial = 0`,
+       WHERE chain_id = $chainId AND is_trivial = 0
+         AND block_number >= $earliestNeededBlock AND block_number <= $maxBlock`,
     )
-    .all({ $chainId: chainId }) as Array<{
+    .all({
+      $chainId: chainId,
+      $earliestNeededBlock: earliestNeededBlock,
+      $maxBlock: maxBlock,
+    }) as Array<{
     handle: string;
     producerTxHash: string;
     producerBlock: number;
@@ -1492,7 +1623,11 @@ function handleDfgStatsWindow(url: URL): Response {
       let maxUpstreamCombined = 0;
       for (const upstream of upstreams) {
         const upstreamBlock = txBlockLookup.get(upstream);
-        if (upstreamBlock === undefined || upstreamBlock < windowStart || upstreamBlock > windowEnd) {
+        if (
+          upstreamBlock === undefined ||
+          upstreamBlock < windowStart ||
+          upstreamBlock > windowEnd
+        ) {
           continue; // truncated (outside window or future block)
         }
         const { inter, combined } = computeDepth(upstream);
@@ -1592,6 +1727,9 @@ function handleDfgStatsWindow(url: URL): Response {
     chainId,
     lookbackBlocks,
     signatureHash,
+    startBlock,
+    endBlock,
+    blockRange: { min: minBlock, max: maxBlock },
     stats: {
       totalTxs,
       dependentTxs,

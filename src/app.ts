@@ -7,6 +7,8 @@ import {
   getAddress,
   http,
   parseAbi,
+  HttpRequestError,
+  TimeoutError,
   type AbiEvent,
 } from "viem";
 
@@ -683,6 +685,31 @@ function isInvalidBlockRangeError(err: unknown): boolean {
   );
 }
 
+function isTooManyLogsError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const record = err as Record<string, unknown>;
+  const message = typeof record.message === "string" ? record.message : "";
+  const details = typeof record.details === "string" ? record.details : "";
+  const shortMessage = typeof record.shortMessage === "string" ? record.shortMessage : "";
+  const combined = `${message}\n${details}\n${shortMessage}`.toLowerCase();
+  return (
+    combined.includes("query exceeds max results") ||
+    combined.includes("exceeds max results") ||
+    combined.includes("too many results") ||
+    combined.includes("max results")
+  );
+}
+
+function isMethodHandlerCrashedError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const record = err as Record<string, unknown>;
+  const message = typeof record.message === "string" ? record.message : "";
+  const details = typeof record.details === "string" ? record.details : "";
+  const shortMessage = typeof record.shortMessage === "string" ? record.shortMessage : "";
+  const combined = `${message}\n${details}\n${shortMessage}`.toLowerCase();
+  return combined.includes("method handler crashed");
+}
+
 async function processRange(
   client: ReturnType<typeof createClient>,
   statements: ReturnType<typeof prepareStatements>,
@@ -693,25 +720,91 @@ async function processRange(
 ): Promise<void> {
   if (fromBlock > toBlock) return;
 
-  let logs: Awaited<ReturnType<typeof client.getLogs>>;
-  try {
-    logs = await client.getLogs({
-      address: executorAddress,
-      fromBlock: BigInt(fromBlock),
-      toBlock: BigInt(toBlock),
-      events: FHE_EVENTS,
-    });
-  } catch (err) {
-    if (fromBlock === toBlock && isInvalidBlockRangeError(err)) {
-      console.warn("getLogs rejected block range; will retry next poll", {
-        chainId,
-        fromBlock,
-        toBlock,
-      });
-      return;
+  // Some RPC providers (e.g. certain gateways) don't support `eth_getLogs` topic OR
+  // queries (i.e. `topics[0] = [sig1, sig2, ...]`). So we fetch logs per event
+  // signature to keep requests maximally compatible.
+  const useSingleEventRequests = true;
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const fetchLogsForRange = async (
+    event: AbiEvent,
+    startBlock: number,
+    endBlock: number,
+  ): Promise<Awaited<ReturnType<typeof client.getLogs>>> => {
+    if (startBlock > endBlock) return [];
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        return await client.getLogs({
+          address: executorAddress,
+          fromBlock: BigInt(startBlock),
+          toBlock: BigInt(endBlock),
+          ...(useSingleEventRequests ? { event } : { events: [event] }),
+        });
+      } catch (err) {
+        if (startBlock === endBlock && isInvalidBlockRangeError(err)) {
+          console.warn("getLogs rejected block range; will retry next poll", {
+            chainId,
+            fromBlock: startBlock,
+            toBlock: endBlock,
+          });
+          return [];
+        }
+        // Some RPC providers enforce a hard cap on log result size per request.
+        // In that case, we retry by splitting the range until it fits.
+        if (startBlock < endBlock && isTooManyLogsError(err)) {
+          const mid = Math.floor((startBlock + endBlock) / 2);
+          const left = await fetchLogsForRange(event, startBlock, mid);
+          const right = await fetchLogsForRange(event, mid + 1, endBlock);
+          return left.concat(right);
+        }
+        // Transient transport issues (rate limits, HTML error pages, etc.).
+        // Retry a few times with backoff.
+        if (
+          attempt < 4 &&
+          (err instanceof HttpRequestError ||
+            err instanceof TimeoutError ||
+            isMethodHandlerCrashedError(err))
+        ) {
+          const backoffMs = 500 * 2 ** attempt;
+          console.warn("getLogs transport error; retrying", {
+            chainId,
+            fromBlock: startBlock,
+            toBlock: endBlock,
+            attempt: attempt + 1,
+            backoffMs,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          await sleep(backoffMs);
+          continue;
+        }
+        throw err;
+      }
     }
-    throw err;
+    return [];
+  };
+
+  const logKey = (log: Awaited<ReturnType<typeof client.getLogs>>[number]) =>
+    `${log.blockNumber ?? 0n}:${log.transactionHash ?? "0x"}:${log.logIndex ?? 0n}`;
+
+  const allLogs: Awaited<ReturnType<typeof client.getLogs>> = [];
+  const seen = new Set<string>();
+  for (const event of FHE_EVENTS) {
+    const eventLogs = await fetchLogsForRange(event, fromBlock, toBlock);
+    for (const log of eventLogs) {
+      const key = logKey(log);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      allLogs.push(log);
+    }
   }
+  const logs = allLogs.sort((a, b) => {
+    const block = Number(a.blockNumber ?? 0n) - Number(b.blockNumber ?? 0n);
+    if (block !== 0) return block;
+    const txi = Number(a.transactionIndex ?? 0n) - Number(b.transactionIndex ?? 0n);
+    if (txi !== 0) return txi;
+    return Number(a.logIndex ?? 0n) - Number(b.logIndex ?? 0n);
+  });
 
   let mismatchCount = 0;
   for (const log of logs) {

@@ -47,11 +47,18 @@ Lightweight FHEVM host-chain stats collector.
 11) Validate DFG integrity (defaults to mainnet + sepolia):
    - `bun run dfg:validate`
    - Optional: `CHAIN_ID=1 MAX_TX=1000 bun run dfg:validate`
+   - Cross-check DFG node inputs vs raw L1 args (catches “missing operand” regressions):
+     - `bun run dfg:validate:inputs`
+     - Optional: `CHAIN_ID=11155111 LOOKBACK_BLOCKS=50 FAIL_ON_MISMATCH=1 bun run dfg:validate:inputs`
 12) Roll up DFG stats (aggregate counts):
    - `bun run dfg:rollup`
    - Incremental by default (only new DFG txs since last checkpoint).
    - Force full rebuild: `DFG_ROLLUP_FULL=1 bun run dfg:rollup`
    - Dependency stats are precomputed during rollup; skip with `DFG_DEPS_ROLLUP=0`.
+13) Scan for intra-block tx dependency cycles (block-level approximation):
+   - `bun run dfg:tx-cycles`
+   - Defaults: last 200 blocks for each chain in `dfg_txs`.
+   - Options: `CHAIN_ID=11155111 START_BLOCK=... END_BLOCK=... LOOKBACK_BLOCKS=... FAIL_ON_CYCLES=1`.
 
 ## API
 - `GET /health`
