@@ -267,6 +267,12 @@ run_build_rollup() {
   local lock_dir="$LOG_DIR/dfg-build.lock"
   if mkdir "$lock_dir" 2>/dev/null; then
     {
+      local dfg_chain_ids
+      if [ -n "${DFG_CHAIN_IDS:-}" ]; then
+        IFS=',' read -r -a dfg_chain_ids <<<"$DFG_CHAIN_IDS"
+      else
+        dfg_chain_ids=(1 11155111)
+      fi
       echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] pausing stream"
       touch "$STREAM_PAUSE_FILE"
       if [ -f "$STREAM_PID_FILE" ]; then
@@ -279,9 +285,15 @@ run_build_rollup() {
         rm -f "$STREAM_PID_FILE"
       fi
       echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] dfg:build"
-      bun run dfg:build
+      for chain_id in "${dfg_chain_ids[@]}"; do
+        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] dfg:build chain_id=${chain_id}"
+        CHAIN_ID="$chain_id" bun run dfg:build
+      done
       echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] dfg:rollup"
-      bun run dfg:rollup
+      for chain_id in "${dfg_chain_ids[@]}"; do
+        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] dfg:rollup chain_id=${chain_id}"
+        CHAIN_ID="$chain_id" bun run dfg:rollup
+      done
       if [ "$SKIP_OPS_ROLLUP" = true ]; then
         echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] skipping rollup:ops:all"
       else
