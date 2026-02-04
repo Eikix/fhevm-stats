@@ -14,6 +14,7 @@ describe("initDatabase", () => {
     expect(names.has("fhe_events")).toBe(true);
     expect(names.has("checkpoints")).toBe(true);
     expect(names.has("op_buckets")).toBe(true);
+    expect(names.has("op_counts")).toBe(true);
     expect(names.has("rollup_checkpoints")).toBe(true);
     expect(names.has("dfg_txs")).toBe(true);
     expect(names.has("dfg_nodes")).toBe(true);

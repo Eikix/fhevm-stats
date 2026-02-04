@@ -173,6 +173,26 @@ function handleIngestion(url: URL): Response {
 function handleOps(url: URL): Response {
   const filters = parseFilters(url);
   const chainId = filters.chainId;
+  const canUseCounts =
+    chainId !== undefined &&
+    filters.startBlock === undefined &&
+    filters.endBlock === undefined &&
+    hasTable("op_counts");
+  if (canUseCounts) {
+    const params: Record<string, string | number> = { $chainId: chainId };
+    const extra = filters.eventName ? " AND event_name = $eventName" : "";
+    if (filters.eventName) params.$eventName = filters.eventName;
+    const rows = db
+      .prepare(
+        `SELECT event_name AS eventName, count AS count
+         FROM op_counts
+         WHERE chain_id = $chainId${extra}
+         ORDER BY count DESC`,
+      )
+      .all(params) as Array<{ eventName: string; count: number }>;
+
+    return jsonResponse({ filters, source: "op_counts", rows });
+  }
   const canUseRollup =
     chainId !== undefined &&
     filters.startBlock === undefined &&

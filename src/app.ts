@@ -333,6 +333,14 @@ export function initDatabase(dbPath: string): Database {
       PRIMARY KEY (chain_id, bucket_start, bucket_seconds, event_name)
     );
 
+    CREATE TABLE IF NOT EXISTS op_counts (
+      chain_id INTEGER NOT NULL,
+      event_name TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (chain_id, event_name)
+    );
+
     CREATE TABLE IF NOT EXISTS rollup_checkpoints (
       chain_id INTEGER PRIMARY KEY,
       last_block INTEGER NOT NULL,
@@ -542,6 +550,18 @@ function prepareStatements(db: Database) {
     VALUES (?, ?, ?)
   `);
 
+  const upsertOpCount = db.prepare(`
+    INSERT INTO op_counts (
+      chain_id,
+      event_name,
+      count
+    )
+    VALUES (?, ?, 1)
+    ON CONFLICT(chain_id, event_name) DO UPDATE
+      SET count = count + 1,
+          updated_at = datetime('now')
+  `);
+
   const getCheckpoint = db.prepare(`
     SELECT last_block FROM checkpoints WHERE chain_id = ?
   `);
@@ -554,7 +574,7 @@ function prepareStatements(db: Database) {
           updated_at = datetime('now')
   `);
 
-  return { insertEvent, insertTxCaller, getCheckpoint, upsertCheckpoint };
+  return { insertEvent, insertTxCaller, upsertOpCount, getCheckpoint, upsertCheckpoint };
 }
 
 function readCheckpoint(
@@ -861,7 +881,7 @@ async function processRange(
       eventName = "Unknown";
     }
 
-    statements.insertEvent.run(
+    const insertResult = statements.insertEvent.run(
       chainId,
       Number(log.blockNumber),
       log.blockHash ?? "",
@@ -884,6 +904,10 @@ async function processRange(
       derived.scalarFlag ?? null,
       derived.resultHandleVersion ?? null,
     );
+
+    if (insertResult.changes) {
+      statements.upsertOpCount.run(chainId, eventName);
+    }
 
     if (callerLower) {
       statements.insertTxCaller.run(chainId, log.transactionHash, callerLower);
