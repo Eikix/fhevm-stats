@@ -1,13 +1,20 @@
 import { Database } from "bun:sqlite";
+import { existsSync } from "node:fs";
+import { resolve, sep } from "node:path";
 
 const DEFAULT_DB_PATH = "data/fhevm_stats.sqlite";
 const DEFAULT_PORT = 4310;
+const DEFAULT_UI_DIST_DIR = "ui/dist";
 
 const dbPath = Bun.env.DB_PATH ?? DEFAULT_DB_PATH;
 const defaultChainId = parseNumber(Bun.env.CHAIN_ID);
 const port = parseNumber(Bun.env.HTTP_PORT, DEFAULT_PORT) ?? DEFAULT_PORT;
 const db = new Database(dbPath, { readonly: true });
 db.exec("PRAGMA busy_timeout=5000;");
+
+const uiDistDir = resolve(Bun.env.UI_DIST_DIR ?? DEFAULT_UI_DIST_DIR);
+const uiIndexPath = resolve(uiDistDir, "index.html");
+const canServeUi = existsSync(uiIndexPath);
 
 type Filters = {
   chainId?: number;
@@ -56,6 +63,13 @@ function hasTable(name: string): boolean {
   return Boolean(row);
 }
 
+function hasIndex(name: string): boolean {
+  const row = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = $name")
+    .get({ $name: name }) as { name: string } | undefined;
+  return Boolean(row);
+}
+
 function parseNumber(value: string | null | undefined, fallback?: number): number | undefined {
   if (value === undefined || value === null || value === "") return fallback;
   const parsed = Number(value);
@@ -98,6 +112,32 @@ function jsonResponse(body: unknown, status = 200): Response {
       "access-control-allow-origin": "*",
     },
   });
+}
+
+function tryServeUi(pathname: string): Response | null {
+  if (!canServeUi) return null;
+  if (pathname === "/health") return null;
+  if (pathname.startsWith("/stats") || pathname.startsWith("/dfg")) return null;
+
+  const raw = pathname === "/" ? "/index.html" : pathname;
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    return null;
+  }
+
+  const candidatePath = resolve(uiDistDir, decoded.replace(/^\//, ""));
+  const uiDistPrefix = uiDistDir.endsWith(sep) ? uiDistDir : `${uiDistDir}${sep}`;
+  if (candidatePath !== uiDistDir && !candidatePath.startsWith(uiDistPrefix)) {
+    return null;
+  }
+
+  if (existsSync(candidatePath)) {
+    return new Response(Bun.file(candidatePath));
+  }
+
+  return new Response(Bun.file(uiIndexPath));
 }
 
 function parseFilters(url: URL): Filters {
@@ -555,9 +595,11 @@ function handleDfgTxs(url: URL): Response {
     clauses.push("t.block_number <= $endBlock");
     params.$endBlock = endBlock;
   }
-  let fromClause = "FROM dfg_txs t";
+  const useBlockIndex = (startBlock !== undefined || endBlock !== undefined) && hasIndex("dfg_txs_block");
+  const txsFrom = useBlockIndex ? "dfg_txs t INDEXED BY dfg_txs_block" : "dfg_txs t";
+  let fromClause = `FROM ${txsFrom}`;
   if (caller && hasTxCallers) {
-    fromClause = `FROM dfg_txs t
+    fromClause = `FROM ${txsFrom}
       JOIN tx_callers c
         ON c.chain_id = t.chain_id AND c.tx_hash = t.tx_hash AND c.caller = $callerLower`;
     params.$callerLower = caller.toLowerCase();
@@ -821,9 +863,12 @@ function handleDfgSignatures(url: URL): Response {
     whereClauses.push("t.block_number <= $endBlock");
     params.$endBlock = endBlock;
   }
-  let fromClause = "FROM dfg_txs t";
+  const useBlockIndex =
+    (startBlock !== undefined || endBlock !== undefined) && hasIndex("dfg_txs_block");
+  const txsFrom = useBlockIndex ? "dfg_txs t INDEXED BY dfg_txs_block" : "dfg_txs t";
+  let fromClause = `FROM ${txsFrom}`;
   if (caller && hasTxCallers) {
-    fromClause = `FROM dfg_txs t
+    fromClause = `FROM ${txsFrom}
       JOIN tx_callers c
         ON c.chain_id = t.chain_id AND c.tx_hash = t.tx_hash AND c.caller = $callerLower`;
     params.$callerLower = caller.toLowerCase();
@@ -2043,6 +2088,10 @@ Bun.serve({
       case "/dfg/pattern":
         return handleDfgPattern(url);
       default:
+        if (req.method === "GET" || req.method === "HEAD") {
+          const uiResponse = tryServeUi(url.pathname);
+          if (uiResponse) return uiResponse;
+        }
         return jsonResponse(
           {
             error: "not_found",
