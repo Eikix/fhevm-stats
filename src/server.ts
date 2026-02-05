@@ -1580,14 +1580,31 @@ function handleDfgStatsWindow(url: URL): Response {
   const lookbackBlocks = parseNumber(url.searchParams.get("lookbackBlocks"), 50) ?? 50;
   const signatureHash = url.searchParams.get("signatureHash") ?? undefined;
   const topLimit = parseNumber(url.searchParams.get("topLimit"), 10) ?? 10;
-  const startBlock = parseNumber(url.searchParams.get("startBlock"));
-  const endBlock = parseNumber(url.searchParams.get("endBlock"));
+  const startBlockParam = parseNumber(url.searchParams.get("startBlock"));
+  const endBlockParam = parseNumber(url.searchParams.get("endBlock"));
 
   if (chainId === undefined) {
     return jsonResponse({ error: "chain_id_required" }, 400);
   }
   if (!hasTable("dfg_inputs") || !hasTable("dfg_handle_producers") || !hasTable("dfg_txs")) {
     return jsonResponse({ error: "dfg_tables_missing" }, 404);
+  }
+
+  // Default to a bounded range at the tip when no explicit range is provided.
+  let startBlock = startBlockParam;
+  let endBlock = endBlockParam;
+  if (startBlock === undefined || endBlock === undefined) {
+    const maxRow = db
+      .prepare("SELECT MAX(block_number) AS maxBlock FROM dfg_txs WHERE chain_id = $chainId")
+      .get({ $chainId: chainId }) as { maxBlock: number | null } | undefined;
+    const maxBlock = maxRow?.maxBlock ?? null;
+    if (maxBlock !== null) {
+      const resolvedEnd = endBlock ?? maxBlock;
+      const resolvedStart =
+        startBlock ?? Math.max(0, resolvedEnd - lookbackBlocks + 1);
+      startBlock = resolvedStart;
+      endBlock = resolvedEnd;
+    }
   }
 
   // Get transactions with their blocks and intra-tx depth (with optional block range filtering)
