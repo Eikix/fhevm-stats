@@ -135,18 +135,6 @@ function handleIngestion(url: URL): Response {
     return jsonResponse({ error: "chain_id_required" }, 400);
   }
 
-  const eventRow = db
-    .prepare(
-      `SELECT MAX(block_number) AS maxBlock,
-              MAX(created_at) AS lastEventAt,
-              COUNT(*) AS eventCount
-       FROM fhe_events
-       WHERE chain_id = $chainId`,
-    )
-    .get({ $chainId: chainId }) as
-    | { maxBlock: number | null; lastEventAt: string | null; eventCount: number }
-    | undefined;
-
   const checkpointRow = db
     .prepare(
       `SELECT last_block AS lastBlock,
@@ -156,12 +144,40 @@ function handleIngestion(url: URL): Response {
     )
     .get({ $chainId: chainId }) as { lastBlock: number; updatedAt: string } | undefined;
 
+  const maxBlockRow = db
+    .prepare("SELECT MAX(block_number) AS maxBlock FROM fhe_events WHERE chain_id = $chainId")
+    .get({ $chainId: chainId }) as { maxBlock: number | null } | undefined;
+
+  const maxBlock = checkpointRow?.lastBlock ?? maxBlockRow?.maxBlock ?? null;
+
+  const lastEventAtRow =
+    maxBlock === null
+      ? undefined
+      : (db
+          .prepare(
+            `SELECT created_at AS lastEventAt
+             FROM fhe_events
+             WHERE chain_id = $chainId
+               AND block_number = $maxBlock
+             ORDER BY log_index DESC
+             LIMIT 1`,
+          )
+          .get({ $chainId: chainId, $maxBlock: maxBlock }) as { lastEventAt: string | null } | undefined);
+
+  const eventCountRow = hasTable("op_counts")
+    ? (db
+        .prepare("SELECT COALESCE(SUM(count), 0) AS eventCount FROM op_counts WHERE chain_id = $chainId")
+        .get({ $chainId: chainId }) as { eventCount: number } | undefined)
+    : (db
+        .prepare("SELECT COUNT(*) AS eventCount FROM fhe_events WHERE chain_id = $chainId")
+        .get({ $chainId: chainId }) as { eventCount: number } | undefined);
+
   return jsonResponse({
     chainId,
     events: {
-      maxBlock: eventRow?.maxBlock ?? null,
-      lastEventAt: eventRow?.lastEventAt ?? null,
-      count: eventRow?.eventCount ?? 0,
+      maxBlock,
+      lastEventAt: lastEventAtRow?.lastEventAt ?? null,
+      count: eventCountRow?.eventCount ?? 0,
     },
     checkpoint: {
       lastBlock: checkpointRow?.lastBlock ?? null,
@@ -275,24 +291,24 @@ function handleOps(url: URL): Response {
 
 function handleSummary(url: URL): Response {
   const filters = parseFilters(url);
-  const canUseCounts =
-    filters.chainId !== undefined &&
+  const chainId = filters.chainId;
+  if (
+    chainId !== undefined &&
     filters.startBlock === undefined &&
     filters.endBlock === undefined &&
     filters.eventName === undefined &&
     hasTable("op_counts") &&
-    hasTable("checkpoints");
-
-  if (canUseCounts) {
+    hasTable("checkpoints")
+  ) {
     const countRow = db
       .prepare("SELECT COALESCE(SUM(count), 0) AS count FROM op_counts WHERE chain_id = $chainId")
-      .get({ $chainId: filters.chainId }) as { count: number };
+      .get({ $chainId: chainId }) as { count: number };
     const minRow = db
       .prepare("SELECT MIN(block_number) AS minBlock FROM fhe_events WHERE chain_id = $chainId")
-      .get({ $chainId: filters.chainId }) as { minBlock: number | null };
+      .get({ $chainId: chainId }) as { minBlock: number | null };
     const maxRow = db
       .prepare("SELECT last_block AS maxBlock FROM checkpoints WHERE chain_id = $chainId")
-      .get({ $chainId: filters.chainId }) as { maxBlock: number | null } | undefined;
+      .get({ $chainId: chainId }) as { maxBlock: number | null } | undefined;
 
     return jsonResponse({
       filters,

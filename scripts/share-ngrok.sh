@@ -388,8 +388,13 @@ if [ -z "$API_URL" ]; then
   exit 1
 fi
 
-echo "Starting UI with VITE_API_BASE=$API_URL..."
-(cd "$UI_DIR" && VITE_API_BASE="$API_URL" bun run dev -- --host 0.0.0.0 >"$LOG_DIR/ui.log" 2>&1) &
+echo "Building UI with VITE_API_BASE=$API_URL..."
+(
+  cd "$UI_DIR"
+  VITE_API_BASE="$API_URL" bun run build >"$LOG_DIR/ui.log" 2>&1
+  echo "Starting UI preview on :5173..." >>"$LOG_DIR/ui.log"
+  VITE_API_BASE="$API_URL" bun run preview -- --host 0.0.0.0 --port 5173 --strictPort >>"$LOG_DIR/ui.log" 2>&1
+) &
 UI_PID=$!
 
 UI_URL="$(wait_for_url "$LOG_DIR/ngrok.log" "ui" || true)"
