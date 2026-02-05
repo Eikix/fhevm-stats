@@ -1689,10 +1689,17 @@ function handleDfgStatsWindow(url: URL): Response {
   // Get handle producers within relevant block range (non-trivial only)
   const producerRows = db
     .prepare(
-      `SELECT handle, tx_hash AS producerTxHash, block_number AS producerBlock
-       FROM dfg_handle_producers
-       WHERE chain_id = $chainId AND is_trivial = 0
-         AND block_number >= $earliestNeededBlock AND block_number <= $maxBlock`,
+      `SELECT p.handle,
+              p.tx_hash AS producerTxHash,
+              t.block_number AS producerBlock
+       FROM dfg_handle_producers p
+       INNER JOIN dfg_txs t
+         ON t.chain_id = p.chain_id
+        AND t.tx_hash = p.tx_hash
+       WHERE p.chain_id = $chainId
+         AND p.is_trivial = 0
+         AND t.block_number >= $earliestNeededBlock
+         AND t.block_number <= $maxBlock`,
     )
     .all({
       $chainId: chainId,
