@@ -52,7 +52,7 @@ SKIP_ROLLUPS=false
 SKIP_OPS_ROLLUP=false
 INTERVAL="10m"
 FORCE=false
-DFG_INITIAL_DELAY_SECONDS=30
+DFG_INITIAL_DELAY_SECONDS=60
 STREAM_RESTART_DELAY_SECONDS=5
 
 print_usage() {
@@ -236,7 +236,6 @@ STREAM_PID_FILE="$LOG_DIR/stream.pid"
 
 if [ "$FORCE" = false ]; then
   check_port_free 4310
-  check_port_free 5173
   check_process "bun run stream"
   check_process "bun run src/server.ts"
   check_process "bun run dev"
@@ -246,18 +245,15 @@ fi
 cleanup() {
   kill_process_tree "${ROLLUP_PID:-}"
   kill_process_tree "${STREAM_PID:-}"
-  kill_process_tree "${UI_PID:-}"
   kill_process_tree "${API_PID:-}"
   kill_process_tree "${NGROK_PID:-}"
 
   wait_for_exit "${ROLLUP_PID:-}"
   wait_for_exit "${STREAM_PID:-}"
-  wait_for_exit "${UI_PID:-}"
   wait_for_exit "${API_PID:-}"
   wait_for_exit "${NGROK_PID:-}"
 
   wait_for_port_free 4310
-  wait_for_port_free 5173
   rm -f "$STREAM_PAUSE_FILE" "$STREAM_PID_FILE"
 }
 
@@ -294,6 +290,11 @@ run_build_rollup() {
         echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] dfg:rollup chain_id=${chain_id}"
         CHAIN_ID="$chain_id" bun run dfg:rollup
       done
+      echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] backfill:dfg-stats"
+      for chain_id in "${dfg_chain_ids[@]}"; do
+        echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] backfill:dfg-stats chain_id=${chain_id}"
+        CHAIN_ID="$chain_id" bun run backfill:dfg-stats
+      done
       if [ "$SKIP_OPS_ROLLUP" = true ]; then
         echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] skipping rollup:ops:all"
       else
@@ -312,6 +313,13 @@ run_build_rollup() {
 }
 
 if [ "$LIVE" = true ]; then
+  if [ "$SKIP_ROLLUPS" = true ]; then
+    echo "Skipping rollups in live mode."
+  else
+    echo "Running initial rollups before starting stream..."
+    run_build_rollup
+  fi
+
   echo "Starting stream (auto-restart)..."
   (
     while true; do
@@ -332,9 +340,7 @@ if [ "$LIVE" = true ]; then
   ) &
   STREAM_PID=$!
 
-  if [ "$SKIP_ROLLUPS" = true ]; then
-    echo "Skipping rollups in live mode."
-  else
+  if [ "$SKIP_ROLLUPS" = false ]; then
     echo "Starting dfg loop (interval: $INTERVAL, initial delay: ${DFG_INITIAL_DELAY_SECONDS}s)..."
     (
       sleep "$DFG_INITIAL_DELAY_SECONDS"
@@ -347,6 +353,12 @@ if [ "$LIVE" = true ]; then
   fi
 fi
 
+echo "Building UI (served from the API process)..."
+(
+  cd "$UI_DIR"
+  VITE_API_BASE="" bun run build >"$LOG_DIR/ui.log" 2>&1
+)
+
 echo "Starting API..."
 bun run serve >"$LOG_DIR/api.log" 2>&1 &
 API_PID=$!
@@ -355,13 +367,9 @@ NGROK_CONFIG_TEMP="$LOG_DIR/ngrok.yml"
 cat >"$NGROK_CONFIG_TEMP" <<'EOF'
 version: "3"
 tunnels:
-  api:
+  app:
     proto: http
     addr: 4310
-    inspect: false
-  ui:
-    proto: http
-    addr: 5173
     inspect: false
 EOF
 
@@ -377,36 +385,19 @@ else
   NGROK_CONFIG_ARG="$NGROK_CONFIG_TEMP"
 fi
 
-echo "Starting ngrok (single agent, api + ui tunnels)..."
+echo "Starting ngrok (single agent)..."
 ngrok start --all --config "$NGROK_CONFIG_ARG" --log=stdout --log-format=logfmt >"$LOG_DIR/ngrok.log" 2>&1 &
 NGROK_PID=$!
 
-API_URL="$(wait_for_url "$LOG_DIR/ngrok.log" "api" || true)"
-if [ -z "$API_URL" ]; then
-  echo "Failed to detect API ngrok URL. Check: $LOG_DIR/ngrok.log"
+APP_URL="$(wait_for_url "$LOG_DIR/ngrok.log" "app" || true)"
+if [ -z "$APP_URL" ]; then
+  echo "Failed to detect ngrok URL. Check: $LOG_DIR/ngrok.log"
   print_log_tail "$LOG_DIR/ngrok.log"
   exit 1
 fi
 
-echo "Building UI with VITE_API_BASE=$API_URL..."
-(
-  cd "$UI_DIR"
-  VITE_API_BASE="$API_URL" bun run build >"$LOG_DIR/ui.log" 2>&1
-  echo "Starting UI preview on :5173..." >>"$LOG_DIR/ui.log"
-  VITE_API_BASE="$API_URL" bun run preview -- --host 0.0.0.0 --port 5173 --strictPort >>"$LOG_DIR/ui.log" 2>&1
-) &
-UI_PID=$!
-
-UI_URL="$(wait_for_url "$LOG_DIR/ngrok.log" "ui" || true)"
-if [ -z "$UI_URL" ]; then
-  echo "Failed to detect UI ngrok URL. Check: $LOG_DIR/ngrok.log"
-  print_log_tail "$LOG_DIR/ngrok.log"
-  exit 1
-fi
-
-echo "API tunnel: $API_URL"
-echo "UI tunnel:  $UI_URL"
-echo "Share the UI tunnel URL with your colleagues."
+echo "App URL: $APP_URL"
+echo "Share this URL with your colleagues."
 echo "Logs: $LOG_DIR"
 if [ "$LIVE" = true ]; then
   echo "Live mode: stream + dfg loop every $INTERVAL"

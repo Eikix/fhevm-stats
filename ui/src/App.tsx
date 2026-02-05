@@ -574,6 +574,13 @@ function App() {
   const activeNetwork =
     NETWORKS.find((network) => network.id === networkId) ?? NETWORKS[0];
   const chainId = activeNetwork.chainId;
+  const apiBaseForDisplay =
+    API_BASE && API_BASE.trim().length > 0
+      ? API_BASE
+      : typeof window !== "undefined"
+        ? window.location.origin
+        : "";
+  const apiBaseLabel = apiBaseForDisplay.replace(/^https?:\/\//, "");
 
   useEffect(() => {
     try {
@@ -1640,7 +1647,7 @@ function App() {
                 Network {activeNetwork.label}
               </span>
               <span className="rounded-full border border-black/10 bg-white/70 px-3 py-1 text-black/70">
-                Source {API_BASE.replace(/^https?:\/\//, "")}
+                Source {apiBaseLabel || "unknown"}
               </span>
             </div>
 
@@ -1690,7 +1697,8 @@ function App() {
 
             {error ? (
               <p className="mt-4 text-sm text-red-600">
-                {error} — check the API server at {API_BASE}.
+                {error} — check the API server at{" "}
+                {apiBaseForDisplay || "unknown"}.
               </p>
             ) : null}
           </section>
@@ -2781,7 +2789,8 @@ function App() {
           </div>
           <p className="muted-text mt-3 max-w-2xl text-sm">
             DFGs are reconstructed from L1 logs per transaction. External inputs
-            are handles not produced inside the same tx.
+            are handles not produced inside the same tx. Scalar inputs are
+            plaintext and appear as separate Scalar nodes.
             {dfgLookback !== null && (
               <span className="text-violet-600">
                 {" "}
