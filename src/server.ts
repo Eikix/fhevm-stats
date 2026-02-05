@@ -586,7 +586,7 @@ function handleDfgTxs(url: URL): Response {
               t.stats_json AS statsJson
        ${fromClause}
        WHERE ${clauses.join(" AND ")}
-       ORDER BY block_number DESC, tx_hash DESC
+       ORDER BY t.block_number DESC, t.tx_hash DESC
        LIMIT $limit OFFSET $offset`,
     )
     .all({ ...params, $limit: limit, $offset: offset }) as Array<{
