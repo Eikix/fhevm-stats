@@ -456,7 +456,14 @@ function App() {
     "loading" | "ready" | "error"
   >("loading");
   const [ingestionError, setIngestionError] = useState<string | null>(null);
-  const [networkId, setNetworkId] = useState<NetworkOption["id"]>("mainnet");
+  const [networkId, setNetworkId] = useState<NetworkOption["id"]>(() => {
+    try {
+      const value = localStorage.getItem("networkId");
+      return value === "sepolia" ? "sepolia" : "mainnet";
+    } catch {
+      return "mainnet";
+    }
+  });
   const [dfgTxs, setDfgTxs] = useState<DfgTxSummary[]>([]);
   const [dfgTotal, setDfgTotal] = useState(0);
   const [dfgStatus, setDfgStatus] = useState<
@@ -519,6 +526,7 @@ function App() {
     }
   });
   const defaultRangeAppliedRef = useRef(false);
+  const autoApplyRangeRef = useRef(false);
   const [dfgStats, setDfgStats] = useState<DfgStatsResponse | null>(null);
   const [dfgStatsStatus, setDfgStatsStatus] = useState<
     "idle" | "loading" | "ready" | "error"
@@ -569,6 +577,7 @@ function App() {
 
   useEffect(() => {
     try {
+      localStorage.setItem("networkId", networkId);
       localStorage.setItem("dfgCaller", dfgCaller);
       localStorage.setItem("dfgRangeMode", dfgRangeMode);
       localStorage.setItem("dfgStartBlock", dfgStartBlock);
@@ -576,7 +585,7 @@ function App() {
     } catch {
       // ignore
     }
-  }, [dfgCaller, dfgRangeMode, dfgStartBlock, dfgEndBlock]);
+  }, [networkId, dfgCaller, dfgRangeMode, dfgStartBlock, dfgEndBlock]);
 
   useEffect(() => {
     if (chainId !== 11155111) return;
@@ -608,10 +617,43 @@ function App() {
     // Roughly 17 hours ≈ ~5100 blocks (12s). Give a little buffer.
     const end = summary.maxBlock;
     const start = Math.max(0, end - 5200);
+    autoApplyRangeRef.current = true;
     setDfgRangeMode("range");
     setDfgStartBlock(String(start));
     setDfgEndBlock(String(end));
   }, [chainId, dfgCaller, summary?.maxBlock]);
+
+  useEffect(() => {
+    defaultRangeAppliedRef.current = false;
+    autoApplyRangeRef.current = false;
+    setSummary(null);
+    setOps([]);
+    setError(null);
+    setOpsError(null);
+    setIngestion(null);
+    setIngestionError(null);
+    setDfgStats(null);
+    setWindowStats(null);
+    setDfgRollup(null);
+    setDfgTxs([]);
+    setDfgTotal(0);
+    setDfgSignatures([]);
+    setDfgSignatureTotal(0);
+    setDfgSignatureTxTotal(0);
+    setDfgSignatureSelection(null);
+    setDfgSelection(null);
+    setDfgQuery("");
+    setDfgRangeMode("window");
+    setDfgStartBlock("");
+    setDfgEndBlock("");
+    setDfgFiltersKey(0);
+    try {
+      localStorage.removeItem("dfgStartBlock");
+      localStorage.removeItem("dfgEndBlock");
+    } catch {
+      // ignore
+    }
+  }, [chainId]);
 
   useEffect(() => {
     const prev = dfgResetRef.current;
@@ -625,14 +667,31 @@ function App() {
   }, [chainId, dfgCaller]);
 
   useEffect(() => {
-    if (!dfgCaller.trim() && dfgFiltersKey === 0) {
-      setDfgFiltersKey(1);
-    }
-  }, [dfgCaller, dfgFiltersKey]);
+    const caller = dfgCaller.trim().toLowerCase();
+    if (!caller) return;
+    if (!/^0x[a-f0-9]{40}$/.test(caller)) return;
+    if (
+      chainId === 11155111 &&
+      caller === "0x9fdd4b67c241779dca4d2eaf3d5946fb699f5d7a" &&
+      !defaultRangeAppliedRef.current
+    )
+      return;
+    setDfgFiltersKey((value) => value + 1);
+  }, [chainId, dfgCaller]);
 
   useEffect(() => {
     setDfgFiltersKey(0);
   }, [dfgRangeMode, dfgStartBlock, dfgEndBlock, windowLookback]);
+
+  useEffect(() => {
+    if (!autoApplyRangeRef.current) return;
+    if (dfgRangeMode !== "range") return;
+    const start = Number(dfgStartBlock);
+    const end = Number(dfgEndBlock);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+    autoApplyRangeRef.current = false;
+    setDfgFiltersKey((value) => value + 1);
+  }, [dfgRangeMode, dfgStartBlock, dfgEndBlock]);
 
   useEffect(() => {
     const interval = window.setInterval(() => {
@@ -767,6 +826,7 @@ function App() {
 
   useEffect(() => {
     if (dfgFiltersKey === 0) return;
+    if (dfgRangeMode === "window" && summary?.maxBlock == null) return;
     const controller = new AbortController();
     const cacheBust = dfgFiltersKey;
     const params = new URLSearchParams();
@@ -843,6 +903,7 @@ function App() {
 
   useEffect(() => {
     if (dfgFiltersKey === 0) return;
+    if (dfgRangeMode === "window" && summary?.maxBlock == null) return;
     const controller = new AbortController();
     const cacheBust = dfgFiltersKey;
     const params = new URLSearchParams();
@@ -2377,9 +2438,11 @@ function App() {
                   ? "Loading"
                   : dfgSignatureStatus === "error"
                     ? "Error"
-                    : `Showing ${formatNumber(dfgSignatures.length)} of ${formatNumber(
-                        dfgSignatureTotal,
-                      )}`}
+                    : dfgFiltersKey === 0
+                      ? "Waiting for apply"
+                      : `Showing ${formatNumber(dfgSignatures.length)} of ${formatNumber(
+                          dfgSignatureTotal,
+                        )}`}
               </p>
               <div className="flex w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-2xl border border-black/10 bg-white/80 px-3 py-2 text-[10px] uppercase tracking-[0.2em] text-black/70 sm:w-auto">
                 <span>Min nodes</span>
@@ -2508,8 +2571,15 @@ function App() {
               <p className="muted-text text-sm">
                 {dfgSignatureError ?? "Failed to load signatures."}
               </p>
+            ) : dfgFiltersKey === 0 ? (
+              <p className="muted-text text-sm">
+                Click <span className="font-semibold">apply</span> to load DFG
+                patterns for the current filters.
+              </p>
             ) : dfgSignatures.length === 0 ? (
-              <p className="muted-text text-sm">No signatures available yet.</p>
+              <p className="muted-text text-sm">
+                No signatures found for this filter window.
+              </p>
             ) : (
               <table className="w-full text-sm">
                 <thead className="text-left text-[11px] uppercase tracking-[0.2em] text-black/60">
@@ -2587,11 +2657,13 @@ function App() {
               <p className="muted-text text-xs uppercase tracking-[0.2em]">
                 Showing {formatNumber(dfgTxs.length)} of{" "}
                 {formatNumber(dfgTotal)} ·{" "}
-                {dfgStatus === "loading"
-                  ? "Loading"
-                  : dfgStatus === "error"
-                    ? "Error"
-                    : "Ready"}
+                {dfgFiltersKey === 0
+                  ? "Waiting for apply"
+                  : dfgStatus === "loading"
+                    ? "Loading"
+                    : dfgStatus === "error"
+                      ? "Error"
+                      : "Ready"}
               </p>
               {dfgLookback !== null && (
                 <div className="flex items-center gap-2 rounded-full border border-violet-200 bg-violet-50 px-3 py-1 text-[10px] uppercase tracking-[0.2em] text-violet-700">
@@ -2662,7 +2734,11 @@ function App() {
                 {dfgDetailError ?? "Failed to load DFG details."}
               </p>
             ) : !dfgSelected ? (
-              <p className="muted-text text-sm">Select a tx to view its DFG.</p>
+              <p className="muted-text text-sm">
+                {dfgFiltersKey === 0
+                  ? "Click apply above to load matching transactions."
+                  : "Select a tx to view its DFG."}
+              </p>
             ) : (
               <>
                 <div className="grid gap-3 md:grid-cols-3">
