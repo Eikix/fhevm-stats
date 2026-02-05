@@ -6,7 +6,14 @@ declare module "@dagrejs/dagre" {
         setDefaultEdgeLabel: (fn: () => Record<string, unknown>) => void;
         setNode: (
           id: string,
-          data: { width: number; height: number; label?: string },
+          data: {
+            width: number;
+            height: number;
+            label?: string;
+            kind?: "op" | "scalar" | "external";
+            subtitle?: string | null;
+            handle?: string;
+          },
         ) => void;
         setEdge: (
           edge: { v: string; w: string; name?: string },
@@ -19,6 +26,10 @@ declare module "@dagrejs/dagre" {
           y: number;
           width: number;
           height: number;
+          label?: string;
+          kind?: "op" | "scalar" | "external";
+          subtitle?: string | null;
+          handle?: string;
         };
         edge: (edge: { v: string; w: string; name?: string }) => {
           points?: Array<{ x: number; y: number }>;

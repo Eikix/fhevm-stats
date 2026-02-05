@@ -115,6 +115,13 @@ function normalizeHandle(value: unknown): string | null {
   return value;
 }
 
+function parseScalarByte(value: unknown): number | null {
+  if (typeof value !== "string" || !value.startsWith("0x")) return null;
+  const parsed = Number.parseInt(value.slice(2), 16);
+  if (!Number.isFinite(parsed)) return null;
+  return parsed === 0 ? 0 : 1;
+}
+
 function incrementCounter<T extends string>(
   target: Record<string, Record<T, number>>,
   op: string,
@@ -176,7 +183,8 @@ function buildDfg(events: EventRow[]) {
 
     const outputHandle = normalizeHandle(args.result);
     const outputKind: ProducedHandle["kind"] = op === "TrivialEncrypt" ? "trivial" : "ciphertext";
-    const scalarFlag = event.scalar_flag ?? null;
+    const scalarFlag =
+      event.scalar_flag ?? parseScalarByte((args as Record<string, unknown>).scalarByte) ?? null;
 
     const inputHandles: Array<{ role: string; handle: string; type?: number | null }> = [];
     const scalarInputs: Array<{ role: string; type?: number | null }> = [];

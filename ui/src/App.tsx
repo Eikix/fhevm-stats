@@ -1003,7 +1003,7 @@ function App() {
 
     load();
     return () => controller.abort();
-  }, [chainId, refreshKey]);
+  }, [chainId, refreshKey, dfgStatsStatus]);
 
   // Load rolling window stats when lookback/chain changes (after DFG stats ready)
   useEffect(() => {
@@ -1069,7 +1069,7 @@ function App() {
 
     load();
     return () => controller.abort();
-  }, [chainId, refreshKey]);
+  }, [chainId, refreshKey, dfgStatsStatus]);
 
   useEffect(() => {
     if (!dfgSelection) {
@@ -1285,11 +1285,108 @@ function App() {
     for (const node of dfgNodes) nodeById.set(node.nodeId, node);
     const edgeLabels = new Map<string, string | null>();
 
+    const computeDuplicateHint = (inputs: DfgInputInfo[]): string | null => {
+      const handleInputs = inputs.filter(
+        (input) => input.kind !== "scalar" && input.handle,
+      );
+      if (handleInputs.length < 2) return null;
+      const counts = new Map<string, number>();
+      const rolesByHandle = new Map<string, Set<string>>();
+      for (const input of handleInputs) {
+        const handle = input.handle;
+        if (!handle) continue;
+        counts.set(handle, (counts.get(handle) ?? 0) + 1);
+        if (!rolesByHandle.has(handle)) rolesByHandle.set(handle, new Set());
+        rolesByHandle.get(handle)?.add(input.role);
+      }
+      const duplicateHandles = [...counts.entries()].filter(
+        ([, count]) => count > 1,
+      );
+      if (duplicateHandles.length === 0) return null;
+      for (const [handle] of duplicateHandles) {
+        const roles = rolesByHandle.get(handle);
+        if (roles?.has("lhs") && roles?.has("rhs")) return "lhs=rhs";
+      }
+      const maxDup = Math.max(...duplicateHandles.map(([, count]) => count));
+      return `dup×${maxDup}`;
+    };
+
     for (const node of dfgNodes) {
+      const inputs = node.typeInfo?.inputs ?? [];
+      const subtitle = computeDuplicateHint(inputs);
       graph.setNode(String(node.nodeId), {
         width: nodeWidth,
         height: nodeHeight,
         label: node.op,
+        kind: "op",
+        subtitle,
+      });
+    }
+    const scalarNodeWidth = 110;
+    const scalarNodeHeight = 32;
+    const scalarEdgePrefix = "s";
+    let scalarEdgeIndex = 0;
+
+    for (const node of dfgNodes) {
+      const inputs = node.typeInfo?.inputs ?? [];
+      const scalarInputs = inputs.filter((input) => input.kind === "scalar");
+      scalarInputs.forEach((input, idx) => {
+        const scalarId = `scalar-${node.nodeId}-${idx}`;
+        const label = input.role ? `Scalar:${input.role}` : "Scalar";
+        graph.setNode(scalarId, {
+          width: scalarNodeWidth,
+          height: scalarNodeHeight,
+          label,
+          kind: "scalar",
+        });
+        const edgeName = `${scalarEdgePrefix}${scalarEdgeIndex++}`;
+        edgeLabels.set(edgeName, null);
+        graph.setEdge(
+          {
+            v: scalarId,
+            w: String(node.nodeId),
+            name: edgeName,
+          },
+          {},
+        );
+      });
+    }
+
+    const externalNodeWidth = 150;
+    const externalNodeHeight = 32;
+    const externalEdgePrefix = "x";
+    let externalEdgeIndex = 0;
+    const externalNodes = new Set<string>();
+
+    for (const node of dfgNodes) {
+      const inputs = node.typeInfo?.inputs ?? [];
+      const externalInputs = inputs.filter(
+        (input) => input.kind === "external" && input.handle,
+      );
+      externalInputs.forEach((input) => {
+        const handle = input.handle;
+        if (!handle) return;
+        const externalId = `external-${handle}`;
+        if (!externalNodes.has(externalId)) {
+          graph.setNode(externalId, {
+            width: externalNodeWidth,
+            height: externalNodeHeight,
+            label: `Ext ${shortenHandle(handle, 4, 4)}`,
+            kind: "external",
+            handle,
+          });
+          externalNodes.add(externalId);
+        }
+        const edgeName = `${externalEdgePrefix}${externalEdgeIndex++}`;
+        edgeLabels.set(edgeName, null);
+        graph.setEdge(
+          {
+            v: externalId,
+            w: String(node.nodeId),
+            name: edgeName,
+          },
+          {},
+        );
       });
     }
     dfgEdges.forEach((edge, index) => {
@@ -1318,7 +1415,10 @@ function App() {
         y: data.y,
         width: data.width,
         height: data.height,
-        label: dfgNodes.find((node) => String(node.nodeId) === id)?.op ?? id,
+        label: data.label ?? id,
+        kind: data.kind ?? "op",
+        subtitle: data.subtitle ?? null,
+        handle: data.handle ?? null,
       };
     });
 
@@ -2444,7 +2544,7 @@ function App() {
                           dfgSignatureTotal,
                         )}`}
               </p>
-              <div className="flex w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-2xl border border-black/10 bg-white/80 px-3 py-2 text-[10px] uppercase tracking-[0.2em] text-black/70 sm:w-auto">
+              <div className="flex w-full max-w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-2xl border border-black/10 bg-white/80 px-3 py-2 text-[10px] uppercase tracking-[0.2em] text-black/70">
                 <span>Min nodes</span>
                 <input
                   type="number"
@@ -2843,24 +2943,41 @@ function App() {
                                 ),
                               ) ?? false;
 
+                            const kind = node.kind ?? "op";
+                            const fill =
+                              kind === "external"
+                                ? "rgba(254, 243, 199, 0.75)"
+                                : kind === "scalar"
+                                  ? "rgba(226, 232, 240, 0.75)"
+                                  : "white";
+
+                            const baseStroke =
+                              kind === "external" || kind === "scalar"
+                                ? "rgba(15, 23, 42, 0.25)"
+                                : "rgba(15, 23, 42, 0.2)";
+
+                            const stroke = hasCutEdge ? "#7c3aed" : baseStroke;
+                            const strokeDasharray =
+                              hasCutEdge || kind === "op" ? undefined : "5 4";
+
                             return (
                               <g
                                 key={node.id}
                                 transform={`translate(${node.x}, ${node.y})`}
                               >
+                                {kind === "external" && node.handle ? (
+                                  <title>{node.handle}</title>
+                                ) : null}
                                 <rect
                                   x={-node.width / 2}
                                   y={-node.height / 2}
                                   width={node.width}
                                   height={node.height}
                                   rx={12}
-                                  fill="white"
-                                  stroke={
-                                    hasCutEdge
-                                      ? "#7c3aed"
-                                      : "rgba(15, 23, 42, 0.2)"
-                                  }
+                                  fill={fill}
+                                  stroke={stroke}
                                   strokeWidth={hasCutEdge ? 2 : 1}
+                                  strokeDasharray={strokeDasharray}
                                 />
                                 {hasCutEdge && (
                                   <circle
@@ -2875,9 +2992,21 @@ function App() {
                                   dominantBaseline="middle"
                                   fontSize="11"
                                   fill="rgba(15, 23, 42, 0.85)"
+                                  y={node.subtitle ? -6 : 0}
                                 >
                                   {node.label}
                                 </text>
+                                {node.subtitle ? (
+                                  <text
+                                    textAnchor="middle"
+                                    dominantBaseline="middle"
+                                    fontSize="9"
+                                    fill="rgba(15, 23, 42, 0.55)"
+                                    y={12}
+                                  >
+                                    {node.subtitle}
+                                  </text>
+                                ) : null}
                               </g>
                             );
                           })}

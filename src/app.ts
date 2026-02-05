@@ -392,6 +392,10 @@ export function initDatabase(dbPath: string): Database {
     );
     CREATE INDEX IF NOT EXISTS dfg_txs_block
       ON dfg_txs(chain_id, block_number);
+    CREATE INDEX IF NOT EXISTS dfg_txs_signature
+      ON dfg_txs(chain_id, signature_hash);
+    CREATE INDEX IF NOT EXISTS dfg_txs_signature_filters
+      ON dfg_txs(chain_id, signature_hash, node_count, edge_count, block_number);
 
     CREATE TABLE IF NOT EXISTS dfg_nodes (
       chain_id INTEGER NOT NULL,

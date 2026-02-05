@@ -162,11 +162,15 @@ function handleIngestion(url: URL): Response {
              ORDER BY log_index DESC
              LIMIT 1`,
           )
-          .get({ $chainId: chainId, $maxBlock: maxBlock }) as { lastEventAt: string | null } | undefined);
+          .get({ $chainId: chainId, $maxBlock: maxBlock }) as
+          | { lastEventAt: string | null }
+          | undefined);
 
   const eventCountRow = hasTable("op_counts")
     ? (db
-        .prepare("SELECT COALESCE(SUM(count), 0) AS eventCount FROM op_counts WHERE chain_id = $chainId")
+        .prepare(
+          "SELECT COALESCE(SUM(count), 0) AS eventCount FROM op_counts WHERE chain_id = $chainId",
+        )
         .get({ $chainId: chainId }) as { eventCount: number } | undefined)
     : (db
         .prepare("SELECT COUNT(*) AS eventCount FROM fhe_events WHERE chain_id = $chainId")
@@ -532,58 +536,55 @@ function handleDfgTxs(url: URL): Response {
   const endBlock = parseNumber(url.searchParams.get("endBlock"));
   const hasTxCallers = hasTable("tx_callers");
 
-  const clauses = ["chain_id = $chainId"];
+  const clauses = ["t.chain_id = $chainId"];
   const params: Record<string, string | number> = { $chainId: chainId };
 
   if (minNodes !== undefined) {
-    clauses.push("node_count >= $minNodes");
+    clauses.push("t.node_count >= $minNodes");
     params.$minNodes = minNodes;
   }
   if (signatureHash) {
-    clauses.push("signature_hash = $signatureHash");
+    clauses.push("t.signature_hash = $signatureHash");
     params.$signatureHash = signatureHash;
   }
   if (startBlock !== undefined) {
-    clauses.push("block_number >= $startBlock");
+    clauses.push("t.block_number >= $startBlock");
     params.$startBlock = startBlock;
   }
   if (endBlock !== undefined) {
-    clauses.push("block_number <= $endBlock");
+    clauses.push("t.block_number <= $endBlock");
     params.$endBlock = endBlock;
   }
-  if (caller) {
+  let fromClause = "FROM dfg_txs t";
+  if (caller && hasTxCallers) {
+    fromClause = `FROM dfg_txs t
+      JOIN tx_callers c
+        ON c.chain_id = t.chain_id AND c.tx_hash = t.tx_hash AND c.caller = $callerLower`;
+    params.$callerLower = caller.toLowerCase();
+  } else if (caller) {
     clauses.push(
-      hasTxCallers
-        ? `EXISTS (
-            SELECT 1
-            FROM tx_callers c
-            WHERE c.chain_id = dfg_txs.chain_id
-              AND c.tx_hash = dfg_txs.tx_hash
-              AND c.caller = $callerLower
-            LIMIT 1
-          )`
-        : `EXISTS (
-            SELECT 1
-            FROM fhe_events e
-            WHERE e.chain_id = dfg_txs.chain_id
-              AND e.tx_hash = dfg_txs.tx_hash
-              AND lower(json_extract(e.args_json, '$.caller')) = $callerLower
-            LIMIT 1
-          )`,
+      `EXISTS (
+         SELECT 1
+         FROM fhe_events e
+         WHERE e.chain_id = t.chain_id
+           AND e.tx_hash = t.tx_hash
+           AND lower(json_extract(e.args_json, '$.caller')) = $callerLower
+         LIMIT 1
+       )`,
     );
     params.$callerLower = caller.toLowerCase();
   }
 
   const rows = db
     .prepare(
-      `SELECT tx_hash AS txHash,
-              block_number AS blockNumber,
-              node_count AS nodeCount,
-              edge_count AS edgeCount,
-              depth,
-              signature_hash AS signatureHash,
-              stats_json AS statsJson
-       FROM dfg_txs
+      `SELECT t.tx_hash AS txHash,
+              t.block_number AS blockNumber,
+              t.node_count AS nodeCount,
+              t.edge_count AS edgeCount,
+              t.depth,
+              t.signature_hash AS signatureHash,
+              t.stats_json AS statsJson
+       ${fromClause}
        WHERE ${clauses.join(" AND ")}
        ORDER BY block_number DESC, tx_hash DESC
        LIMIT $limit OFFSET $offset`,
@@ -611,7 +612,7 @@ function handleDfgTxs(url: URL): Response {
   const totalRow = db
     .prepare(
       `SELECT COUNT(*) AS count
-       FROM dfg_txs
+       ${fromClause}
        WHERE ${clauses.join(" AND ")}`,
     )
     .get(params) as { count: number };
@@ -799,10 +800,10 @@ function handleDfgSignatures(url: URL): Response {
 
   // Build WHERE clauses for optional block range filtering
   const whereClauses = [
-    "chain_id = $chainId",
-    "signature_hash IS NOT NULL",
-    "node_count >= $minNodes",
-    "edge_count >= $minEdges",
+    "t.chain_id = $chainId",
+    "t.signature_hash IS NOT NULL",
+    "t.node_count >= $minNodes",
+    "t.edge_count >= $minEdges",
   ];
   const params: Record<string, string | number> = {
     $chainId: chainId,
@@ -813,32 +814,29 @@ function handleDfgSignatures(url: URL): Response {
   };
 
   if (startBlock !== undefined) {
-    whereClauses.push("block_number >= $startBlock");
+    whereClauses.push("t.block_number >= $startBlock");
     params.$startBlock = startBlock;
   }
   if (endBlock !== undefined) {
-    whereClauses.push("block_number <= $endBlock");
+    whereClauses.push("t.block_number <= $endBlock");
     params.$endBlock = endBlock;
   }
-  if (caller) {
+  let fromClause = "FROM dfg_txs t";
+  if (caller && hasTxCallers) {
+    fromClause = `FROM dfg_txs t
+      JOIN tx_callers c
+        ON c.chain_id = t.chain_id AND c.tx_hash = t.tx_hash AND c.caller = $callerLower`;
+    params.$callerLower = caller.toLowerCase();
+  } else if (caller) {
     whereClauses.push(
-      hasTxCallers
-        ? `EXISTS (
-            SELECT 1
-            FROM tx_callers c
-            WHERE c.chain_id = dfg_txs.chain_id
-              AND c.tx_hash = dfg_txs.tx_hash
-              AND c.caller = $callerLower
-            LIMIT 1
-          )`
-        : `EXISTS (
-            SELECT 1
-            FROM fhe_events e
-            WHERE e.chain_id = dfg_txs.chain_id
-              AND e.tx_hash = dfg_txs.tx_hash
-              AND lower(json_extract(e.args_json, '$.caller')) = $callerLower
-            LIMIT 1
-          )`,
+      `EXISTS (
+         SELECT 1
+         FROM fhe_events e
+         WHERE e.chain_id = t.chain_id
+           AND e.tx_hash = t.tx_hash
+           AND lower(json_extract(e.args_json, '$.caller')) = $callerLower
+         LIMIT 1
+       )`,
     );
     params.$callerLower = caller.toLowerCase();
   }
@@ -851,7 +849,7 @@ function handleDfgSignatures(url: URL): Response {
               COUNT(*) AS txCount,
               AVG(node_count) AS avgNodes,
               AVG(edge_count) AS avgEdges
-       FROM dfg_txs
+       ${fromClause}
        WHERE ${whereClause}
        GROUP BY signature_hash
        ORDER BY txCount DESC
@@ -872,7 +870,7 @@ function handleDfgSignatures(url: URL): Response {
   const totalRow = db
     .prepare(
       `SELECT COUNT(DISTINCT signature_hash) AS count
-       FROM dfg_txs
+       ${fromClause}
        WHERE ${whereClause}`,
     )
     .get(countParams) as { count: number };
@@ -880,7 +878,7 @@ function handleDfgSignatures(url: URL): Response {
   const txTotalRow = db
     .prepare(
       `SELECT COUNT(*) AS count
-       FROM dfg_txs
+       ${fromClause}
        WHERE ${whereClause}`,
     )
     .get(countParams) as { count: number };
@@ -1600,8 +1598,7 @@ function handleDfgStatsWindow(url: URL): Response {
     const maxBlock = maxRow?.maxBlock ?? null;
     if (maxBlock !== null) {
       const resolvedEnd = endBlock ?? maxBlock;
-      const resolvedStart =
-        startBlock ?? Math.max(0, resolvedEnd - lookbackBlocks + 1);
+      const resolvedStart = startBlock ?? Math.max(0, resolvedEnd - lookbackBlocks + 1);
       startBlock = resolvedStart;
       endBlock = resolvedEnd;
     }
