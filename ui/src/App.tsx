@@ -1003,7 +1003,7 @@ function App() {
 
     load();
     return () => controller.abort();
-  }, [chainId, refreshKey, dfgStatsStatus]);
+  }, [chainId, refreshKey]);
 
   // Load rolling window stats when lookback/chain changes (after DFG stats ready)
   useEffect(() => {
