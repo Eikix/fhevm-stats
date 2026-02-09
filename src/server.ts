@@ -5,10 +5,133 @@ import { resolve, sep } from "node:path";
 const DEFAULT_DB_PATH = "data/fhevm_stats.sqlite";
 const DEFAULT_PORT = 4310;
 const DEFAULT_UI_DIST_DIR = "ui/dist";
+const DEFAULT_HOST = "127.0.0.1";
+const DEFAULT_RATE_LIMIT_WINDOW_MS = 60_000;
+const DEFAULT_RATE_LIMIT_MAX_REQUESTS = 240;
+const DEFAULT_MAX_PAGE_LIMIT = 100;
+const DEFAULT_MAX_PAGE_OFFSET = 10_000;
+const DEFAULT_MAX_BLOCK_SPAN = 200_000;
+const DEFAULT_MAX_WINDOW_LOOKBACK = 2_000;
+const DEFAULT_MAX_TOP_LIMIT = 100;
+const DEFAULT_MAX_EXAMPLE_LIMIT = 100;
+const DEFAULT_MAX_HORIZON_SIZE = 10_000;
+const DEFAULT_MAX_BUCKET_SIZE = 100_000;
+const DEFAULT_MAX_EVENT_NAME_LENGTH = 128;
+const DEFAULT_MAX_MIN_NODES = 50_000;
+const DEFAULT_MAX_MIN_EDGES = 50_000;
+const DEFAULT_MAX_CHAIN_ID = 2_147_483_647;
+const DEFAULT_MAX_BLOCK_NUMBER = 9_999_999_999;
 
 const dbPath = Bun.env.DB_PATH ?? DEFAULT_DB_PATH;
 const defaultChainId = parseNumber(Bun.env.CHAIN_ID);
-const port = parseNumber(Bun.env.HTTP_PORT, DEFAULT_PORT) ?? DEFAULT_PORT;
+const port = Math.max(1, Math.trunc(parseNumber(Bun.env.HTTP_PORT, DEFAULT_PORT) ?? DEFAULT_PORT));
+const host = Bun.env.HTTP_HOST ?? DEFAULT_HOST;
+const exposeDbStats = Bun.env.EXPOSE_DB_STATS === "1";
+const maxPageOffset = Math.max(
+  0,
+  Math.trunc(
+    parseNumber(Bun.env.MAX_PAGE_OFFSET, DEFAULT_MAX_PAGE_OFFSET) ?? DEFAULT_MAX_PAGE_OFFSET,
+  ),
+);
+const maxPageLimit = Math.max(
+  1,
+  Math.trunc(parseNumber(Bun.env.MAX_PAGE_LIMIT, DEFAULT_MAX_PAGE_LIMIT) ?? DEFAULT_MAX_PAGE_LIMIT),
+);
+const maxBlockSpan = Math.max(
+  1,
+  Math.trunc(parseNumber(Bun.env.MAX_BLOCK_SPAN, DEFAULT_MAX_BLOCK_SPAN) ?? DEFAULT_MAX_BLOCK_SPAN),
+);
+const maxWindowLookback = Math.max(
+  1,
+  Math.trunc(
+    parseNumber(Bun.env.MAX_WINDOW_LOOKBACK, DEFAULT_MAX_WINDOW_LOOKBACK) ??
+      DEFAULT_MAX_WINDOW_LOOKBACK,
+  ),
+);
+const maxTopLimit = Math.max(
+  1,
+  Math.trunc(parseNumber(Bun.env.MAX_TOP_LIMIT, DEFAULT_MAX_TOP_LIMIT) ?? DEFAULT_MAX_TOP_LIMIT),
+);
+const maxExampleLimit = Math.max(
+  1,
+  Math.trunc(
+    parseNumber(Bun.env.MAX_EXAMPLE_LIMIT, DEFAULT_MAX_EXAMPLE_LIMIT) ?? DEFAULT_MAX_EXAMPLE_LIMIT,
+  ),
+);
+const maxHorizonSize = Math.max(
+  1,
+  Math.trunc(
+    parseNumber(Bun.env.MAX_HORIZON_SIZE, DEFAULT_MAX_HORIZON_SIZE) ?? DEFAULT_MAX_HORIZON_SIZE,
+  ),
+);
+const maxBucketSize = Math.max(
+  1,
+  Math.trunc(
+    parseNumber(Bun.env.MAX_BUCKET_SIZE, DEFAULT_MAX_BUCKET_SIZE) ?? DEFAULT_MAX_BUCKET_SIZE,
+  ),
+);
+const maxEventNameLength = Math.max(
+  1,
+  Math.trunc(
+    parseNumber(Bun.env.MAX_EVENT_NAME_LENGTH, DEFAULT_MAX_EVENT_NAME_LENGTH) ??
+      DEFAULT_MAX_EVENT_NAME_LENGTH,
+  ),
+);
+const maxMinNodes = Math.max(
+  0,
+  Math.trunc(parseNumber(Bun.env.MAX_MIN_NODES, DEFAULT_MAX_MIN_NODES) ?? DEFAULT_MAX_MIN_NODES),
+);
+const maxMinEdges = Math.max(
+  0,
+  Math.trunc(parseNumber(Bun.env.MAX_MIN_EDGES, DEFAULT_MAX_MIN_EDGES) ?? DEFAULT_MAX_MIN_EDGES),
+);
+const maxChainId = Math.max(
+  1,
+  Math.trunc(parseNumber(Bun.env.MAX_CHAIN_ID, DEFAULT_MAX_CHAIN_ID) ?? DEFAULT_MAX_CHAIN_ID),
+);
+const maxBlockNumber = Math.max(
+  1,
+  Math.trunc(
+    parseNumber(Bun.env.MAX_BLOCK_NUMBER, DEFAULT_MAX_BLOCK_NUMBER) ?? DEFAULT_MAX_BLOCK_NUMBER,
+  ),
+);
+const rateLimitWindowMs = Math.max(
+  1_000,
+  Math.trunc(
+    parseNumber(Bun.env.RATE_LIMIT_WINDOW_MS, DEFAULT_RATE_LIMIT_WINDOW_MS) ??
+      DEFAULT_RATE_LIMIT_WINDOW_MS,
+  ),
+);
+const rateLimitMaxRequests = Math.max(
+  1,
+  Math.trunc(
+    parseNumber(Bun.env.RATE_LIMIT_MAX_REQUESTS, DEFAULT_RATE_LIMIT_MAX_REQUESTS) ??
+      DEFAULT_RATE_LIMIT_MAX_REQUESTS,
+  ),
+);
+const rateLimitDisabled = Bun.env.RATE_LIMIT_DISABLED === "1";
+const corsAllowedOrigins = new Set(
+  (Bun.env.CORS_ALLOW_ORIGINS ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0),
+);
+const cspHeader =
+  Bun.env.CONTENT_SECURITY_POLICY ??
+  "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; script-src 'self'; connect-src 'self'";
+
+const CALLER_REGEX = /^0x[a-fA-F0-9]{40}$/;
+const TX_HASH_REGEX = /^0x[a-fA-F0-9]{64}$/;
+const SIGNATURE_HASH_REGEX = /^[a-fA-F0-9]{64}$/;
+
+type RateLimitBucket = {
+  windowStartMs: number;
+  count: number;
+};
+
+const rateLimitBuckets = new Map<string, RateLimitBucket>();
+let lastRateLimitSweepMs = Date.now();
+
 const db = new Database(dbPath, { readonly: true });
 db.exec("PRAGMA busy_timeout=5000;");
 
@@ -76,6 +199,235 @@ function parseNumber(value: string | null | undefined, fallback?: number): numbe
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function parseInteger(value: string | null | undefined): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const trimmed = value.trim();
+  if (!/^-?\d+$/.test(trimmed)) return Number.NaN;
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) ? parsed : Number.NaN;
+}
+
+function appendVary(existing: string | null, value: string): string {
+  const entries = new Set(
+    (existing ?? "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0),
+  );
+  entries.add(value);
+  return [...entries].join(", ");
+}
+
+function resolveCorsOrigin(req: Request, url: URL): string | null {
+  const originHeader = req.headers.get("origin");
+  if (!originHeader) return null;
+  let origin: string;
+  try {
+    origin = new URL(originHeader).origin;
+  } catch {
+    return null;
+  }
+
+  if (origin === url.origin) return origin;
+  if (corsAllowedOrigins.has(origin)) return origin;
+  return null;
+}
+
+function applySecurityHeaders(headers: Headers): void {
+  headers.set("x-content-type-options", "nosniff");
+  headers.set("x-frame-options", "DENY");
+  headers.set("referrer-policy", "no-referrer");
+  headers.set("cross-origin-opener-policy", "same-origin");
+  headers.set("cross-origin-resource-policy", "same-origin");
+  headers.set("permissions-policy", "geolocation=(), microphone=(), camera=(), payment=(), usb=()");
+  headers.set("content-security-policy", cspHeader);
+}
+
+function finalizeResponse(
+  req: Request,
+  url: URL,
+  response: Response,
+  isApiPathname: boolean,
+): Response {
+  const headers = new Headers(response.headers);
+  applySecurityHeaders(headers);
+
+  if (isApiPathname) {
+    const corsOrigin = resolveCorsOrigin(req, url);
+    if (corsOrigin) {
+      headers.set("access-control-allow-origin", corsOrigin);
+      if (!headers.has("access-control-allow-methods")) {
+        headers.set("access-control-allow-methods", "GET, HEAD, OPTIONS");
+      }
+      if (!headers.has("access-control-allow-headers")) {
+        headers.set("access-control-allow-headers", "content-type");
+      }
+      headers.set("vary", appendVary(headers.get("vary"), "Origin"));
+    }
+  }
+
+  return new Response(response.body, {
+    status: response.status,
+    headers,
+  });
+}
+
+function handlePreflight(req: Request, url: URL): Response {
+  const corsOrigin = resolveCorsOrigin(req, url);
+  if (!corsOrigin) {
+    return jsonResponse({ error: "origin_not_allowed" }, 403);
+  }
+
+  const requestedHeaders = req.headers.get("access-control-request-headers");
+  const headers = new Headers({
+    "access-control-allow-origin": corsOrigin,
+    "access-control-allow-methods": "GET, HEAD, OPTIONS",
+    "access-control-allow-headers": requestedHeaders ?? "content-type",
+    "access-control-max-age": "600",
+    vary: "Origin",
+  });
+  return new Response(null, { status: 204, headers });
+}
+
+function resolveClientKey(req: Request): string {
+  const xForwardedFor = req.headers.get("x-forwarded-for");
+  if (xForwardedFor) {
+    const candidate = xForwardedFor.split(",")[0]?.trim();
+    if (candidate) return candidate.slice(0, 64);
+  }
+  const xRealIp = req.headers.get("x-real-ip");
+  if (xRealIp) return xRealIp.trim().slice(0, 64);
+  return "unknown";
+}
+
+function isRateLimited(
+  req: Request,
+  pathname: string,
+): { limited: boolean; retryAfterSeconds: number } {
+  if (rateLimitDisabled) return { limited: false, retryAfterSeconds: 0 };
+
+  const now = Date.now();
+  if (now - lastRateLimitSweepMs >= rateLimitWindowMs * 2) {
+    for (const [key, bucket] of rateLimitBuckets) {
+      if (now - bucket.windowStartMs >= rateLimitWindowMs * 2) {
+        rateLimitBuckets.delete(key);
+      }
+    }
+    lastRateLimitSweepMs = now;
+  }
+
+  const clientKey = resolveClientKey(req);
+  const key = `${clientKey}:${pathname}`;
+  const bucket = rateLimitBuckets.get(key);
+  if (!bucket || now - bucket.windowStartMs >= rateLimitWindowMs) {
+    rateLimitBuckets.set(key, { windowStartMs: now, count: 1 });
+    return { limited: false, retryAfterSeconds: 0 };
+  }
+
+  bucket.count += 1;
+  if (bucket.count > rateLimitMaxRequests) {
+    const retryAfterSeconds = Math.max(
+      1,
+      Math.ceil((bucket.windowStartMs + rateLimitWindowMs - now) / 1000),
+    );
+    return { limited: true, retryAfterSeconds };
+  }
+
+  return { limited: false, retryAfterSeconds: 0 };
+}
+
+function validateIntParam(
+  value: number | undefined,
+  name: string,
+  min: number,
+  max: number,
+): Response | null {
+  if (value === undefined) return null;
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    return jsonResponse(
+      {
+        error: "invalid_parameter",
+        parameter: name,
+        min,
+        max,
+      },
+      400,
+    );
+  }
+  return null;
+}
+
+function validateBlockRange(startBlock?: number, endBlock?: number): Response | null {
+  const startError = validateIntParam(startBlock, "startBlock", 0, maxBlockNumber);
+  if (startError) return startError;
+  const endError = validateIntParam(endBlock, "endBlock", 0, maxBlockNumber);
+  if (endError) return endError;
+  if (startBlock !== undefined && endBlock !== undefined) {
+    if (startBlock > endBlock) {
+      return jsonResponse({ error: "invalid_block_range" }, 400);
+    }
+    if (endBlock - startBlock > maxBlockSpan) {
+      return jsonResponse(
+        {
+          error: "block_range_too_wide",
+          maxBlockSpan,
+        },
+        400,
+      );
+    }
+  }
+  return null;
+}
+
+function validatePagination(limit: number, offset: number): Response | null {
+  const limitError = validateIntParam(limit, "limit", 1, maxPageLimit);
+  if (limitError) return limitError;
+  const offsetError = validateIntParam(offset, "offset", 0, maxPageOffset);
+  if (offsetError) return offsetError;
+  return null;
+}
+
+function validateSignatureHash(signatureHash: string | undefined): Response | null {
+  if (!signatureHash) return null;
+  if (!SIGNATURE_HASH_REGEX.test(signatureHash)) {
+    return jsonResponse({ error: "invalid_signature_hash" }, 400);
+  }
+  return null;
+}
+
+function validateTxHash(txHash: string): Response | null {
+  if (!TX_HASH_REGEX.test(txHash)) {
+    return jsonResponse({ error: "invalid_tx_hash" }, 400);
+  }
+  return null;
+}
+
+function validateCaller(caller: string | undefined): Response | null {
+  if (!caller) return null;
+  if (!CALLER_REGEX.test(caller)) {
+    return jsonResponse({ error: "invalid_caller" }, 400);
+  }
+  return null;
+}
+
+function validateFilters(filters: Filters): Response | null {
+  const chainIdError = validateIntParam(filters.chainId, "chainId", 0, maxChainId);
+  if (chainIdError) return chainIdError;
+  const rangeError = validateBlockRange(filters.startBlock, filters.endBlock);
+  if (rangeError) return rangeError;
+  if (filters.eventName && filters.eventName.length > maxEventNameLength) {
+    return jsonResponse({ error: "event_name_too_long" }, 400);
+  }
+  return null;
+}
+
+function isApiPath(pathname: string): boolean {
+  if (pathname === "/health") return true;
+  if (pathname.startsWith("/stats")) return true;
+  if (pathname.startsWith("/dfg")) return true;
+  return false;
+}
+
 function buildWhereClause(filters: Filters): {
   clause: string;
   params: Record<string, string | number>;
@@ -109,7 +461,6 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: {
       "content-type": "application/json",
-      "access-control-allow-origin": "*",
     },
   });
 }
@@ -141,15 +492,17 @@ function tryServeUi(pathname: string): Response | null {
 }
 
 function parseFilters(url: URL): Filters {
-  const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
-  const startBlock = parseNumber(url.searchParams.get("startBlock"));
-  const endBlock = parseNumber(url.searchParams.get("endBlock"));
-  const eventName = url.searchParams.get("eventName") ?? undefined;
+  const chainId = parseInteger(url.searchParams.get("chainId")) ?? defaultChainId;
+  const startBlock = parseInteger(url.searchParams.get("startBlock"));
+  const endBlock = parseInteger(url.searchParams.get("endBlock"));
+  const rawEventName = url.searchParams.get("eventName");
+  const eventName =
+    rawEventName && rawEventName.trim().length > 0 ? rawEventName.trim() : undefined;
   return { chainId, startBlock, endBlock, eventName };
 }
 
 function handleHealth(): Response {
-  return jsonResponse({ status: "ok", dbPath, defaultChainId, port });
+  return jsonResponse({ status: "ok" });
 }
 
 function handleDbStats(): Response {
@@ -163,14 +516,17 @@ function handleDbStats(): Response {
     .get() as { sizeBytes: number };
 
   return jsonResponse({
-    dbPath,
     events: totalRow.count,
     sizeBytes: sizeRow.sizeBytes,
   });
 }
 
 function handleIngestion(url: URL): Response {
-  const { chainId } = parseFilters(url);
+  const filters = parseFilters(url);
+  const filtersError = validateFilters(filters);
+  if (filtersError) return filtersError;
+
+  const { chainId } = filters;
   if (chainId === undefined) {
     return jsonResponse({ error: "chain_id_required" }, 400);
   }
@@ -232,6 +588,8 @@ function handleIngestion(url: URL): Response {
 
 function handleOps(url: URL): Response {
   const filters = parseFilters(url);
+  const filtersError = validateFilters(filters);
+  if (filtersError) return filtersError;
   const chainId = filters.chainId;
   const canUseCounts =
     chainId !== undefined &&
@@ -335,6 +693,8 @@ function handleOps(url: URL): Response {
 
 function handleSummary(url: URL): Response {
   const filters = parseFilters(url);
+  const filtersError = validateFilters(filters);
+  if (filtersError) return filtersError;
   const chainId = filters.chainId;
   if (
     chainId !== undefined &&
@@ -380,7 +740,13 @@ function handleSummary(url: URL): Response {
 
 function handleBuckets(url: URL): Response {
   const filters = parseFilters(url);
-  const bucketSize = parseNumber(url.searchParams.get("bucketSize"), 1000) ?? 1000;
+  const filtersError = validateFilters(filters);
+  if (filtersError) return filtersError;
+
+  const bucketSize = parseInteger(url.searchParams.get("bucketSize")) ?? 1000;
+  const bucketSizeError = validateIntParam(bucketSize, "bucketSize", 1, maxBucketSize);
+  if (bucketSizeError) return bucketSizeError;
+
   const { clause, params } = buildWhereClause(filters);
   const rows = db
     .prepare(
@@ -398,6 +764,9 @@ function handleBuckets(url: URL): Response {
 
 function handleTypes(url: URL): Response {
   const filters = parseFilters(url);
+  const filtersError = validateFilters(filters);
+  if (filtersError) return filtersError;
+
   const role = url.searchParams.get("role") ?? "result";
   const column = TYPE_COLUMNS[role];
   if (!column) {
@@ -429,6 +798,9 @@ function handleTypes(url: URL): Response {
 
 function handleOpTypes(url: URL): Response {
   const filters = parseFilters(url);
+  const filtersError = validateFilters(filters);
+  if (filtersError) return filtersError;
+
   const role = url.searchParams.get("role") ?? "result";
   const includeScalar = url.searchParams.get("includeScalar") === "1";
   const column = TYPE_COLUMNS[role];
@@ -552,7 +924,9 @@ function normalizeDepStats(value: unknown): DepStats | null {
 }
 
 function handleDfgTxs(url: URL): Response {
-  const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainId = parseInteger(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainIdError = validateIntParam(chainId, "chainId", 0, maxChainId);
+  if (chainIdError) return chainIdError;
   if (chainId === undefined) {
     return jsonResponse({ error: "chain_id_required" }, 400);
   }
@@ -567,13 +941,27 @@ function handleDfgTxs(url: URL): Response {
     });
   }
 
-  const limit = parseNumber(url.searchParams.get("limit"), 25) ?? 25;
-  const offset = parseNumber(url.searchParams.get("offset"), 0) ?? 0;
-  const minNodes = parseNumber(url.searchParams.get("minNodes"));
+  const limit = parseInteger(url.searchParams.get("limit")) ?? 25;
+  const offset = parseInteger(url.searchParams.get("offset")) ?? 0;
+  const minNodes = parseInteger(url.searchParams.get("minNodes"));
   const signatureHash = url.searchParams.get("signatureHash") ?? undefined;
-  const caller = url.searchParams.get("caller") ?? undefined;
-  const startBlock = parseNumber(url.searchParams.get("startBlock"));
-  const endBlock = parseNumber(url.searchParams.get("endBlock"));
+  const callerRaw = url.searchParams.get("caller");
+  const caller =
+    callerRaw && callerRaw.trim().length > 0 ? callerRaw.trim().toLowerCase() : undefined;
+  const startBlock = parseInteger(url.searchParams.get("startBlock"));
+  const endBlock = parseInteger(url.searchParams.get("endBlock"));
+
+  const paginationError = validatePagination(limit, offset);
+  if (paginationError) return paginationError;
+  const minNodesError = validateIntParam(minNodes, "minNodes", 0, maxMinNodes);
+  if (minNodesError) return minNodesError;
+  const signatureHashError = validateSignatureHash(signatureHash);
+  if (signatureHashError) return signatureHashError;
+  const callerError = validateCaller(caller);
+  if (callerError) return callerError;
+  const rangeError = validateBlockRange(startBlock, endBlock);
+  if (rangeError) return rangeError;
+
   const hasTxCallers = hasTable("tx_callers");
 
   const clauses = ["t.chain_id = $chainId"];
@@ -595,14 +983,15 @@ function handleDfgTxs(url: URL): Response {
     clauses.push("t.block_number <= $endBlock");
     params.$endBlock = endBlock;
   }
-  const useBlockIndex = (startBlock !== undefined || endBlock !== undefined) && hasIndex("dfg_txs_block");
+  const useBlockIndex =
+    (startBlock !== undefined || endBlock !== undefined) && hasIndex("dfg_txs_block");
   const txsFrom = useBlockIndex ? "dfg_txs t INDEXED BY dfg_txs_block" : "dfg_txs t";
   let fromClause = `FROM ${txsFrom}`;
   if (caller && hasTxCallers) {
     fromClause = `FROM ${txsFrom}
       JOIN tx_callers c
         ON c.chain_id = t.chain_id AND c.tx_hash = t.tx_hash AND c.caller = $callerLower`;
-    params.$callerLower = caller.toLowerCase();
+    params.$callerLower = caller;
   } else if (caller) {
     clauses.push(
       `EXISTS (
@@ -614,7 +1003,7 @@ function handleDfgTxs(url: URL): Response {
          LIMIT 1
        )`,
     );
-    params.$callerLower = caller.toLowerCase();
+    params.$callerLower = caller;
   }
 
   const rows = db
@@ -669,7 +1058,9 @@ function handleDfgTxs(url: URL): Response {
 }
 
 function handleDfgTx(url: URL): Response {
-  const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainId = parseInteger(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainIdError = validateIntParam(chainId, "chainId", 0, maxChainId);
+  if (chainIdError) return chainIdError;
   if (chainId === undefined) {
     return jsonResponse({ error: "chain_id_required" }, 400);
   }
@@ -681,8 +1072,12 @@ function handleDfgTx(url: URL): Response {
   if (!txHash) {
     return jsonResponse({ error: "tx_hash_required" }, 400);
   }
+  const txHashError = validateTxHash(txHash);
+  if (txHashError) return txHashError;
 
-  const lookbackBlocks = parseNumber(url.searchParams.get("lookbackBlocks"));
+  const lookbackBlocks = parseInteger(url.searchParams.get("lookbackBlocks"));
+  const lookbackError = validateIntParam(lookbackBlocks, "lookbackBlocks", 1, maxWindowLookback);
+  if (lookbackError) return lookbackError;
 
   const txRow = db
     .prepare(
@@ -816,7 +1211,9 @@ function handleDfgTx(url: URL): Response {
 }
 
 function handleDfgSignatures(url: URL): Response {
-  const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainId = parseInteger(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainIdError = validateIntParam(chainId, "chainId", 0, maxChainId);
+  if (chainIdError) return chainIdError;
   if (chainId === undefined) {
     return jsonResponse({ error: "chain_id_required" }, 400);
   }
@@ -831,13 +1228,27 @@ function handleDfgSignatures(url: URL): Response {
     });
   }
 
-  const limit = parseNumber(url.searchParams.get("limit"), 10) ?? 10;
-  const offset = parseNumber(url.searchParams.get("offset"), 0) ?? 0;
-  const minNodes = parseNumber(url.searchParams.get("minNodes"), 1) ?? 1;
-  const minEdges = parseNumber(url.searchParams.get("minEdges"), 0) ?? 0;
-  const startBlock = parseNumber(url.searchParams.get("startBlock"));
-  const endBlock = parseNumber(url.searchParams.get("endBlock"));
-  const caller = url.searchParams.get("caller") ?? undefined;
+  const limit = parseInteger(url.searchParams.get("limit")) ?? 10;
+  const offset = parseInteger(url.searchParams.get("offset")) ?? 0;
+  const minNodes = parseInteger(url.searchParams.get("minNodes")) ?? 1;
+  const minEdges = parseInteger(url.searchParams.get("minEdges")) ?? 0;
+  const startBlock = parseInteger(url.searchParams.get("startBlock"));
+  const endBlock = parseInteger(url.searchParams.get("endBlock"));
+  const callerRaw = url.searchParams.get("caller");
+  const caller =
+    callerRaw && callerRaw.trim().length > 0 ? callerRaw.trim().toLowerCase() : undefined;
+
+  const paginationError = validatePagination(limit, offset);
+  if (paginationError) return paginationError;
+  const minNodesError = validateIntParam(minNodes, "minNodes", 0, maxMinNodes);
+  if (minNodesError) return minNodesError;
+  const minEdgesError = validateIntParam(minEdges, "minEdges", 0, maxMinEdges);
+  if (minEdgesError) return minEdgesError;
+  const rangeError = validateBlockRange(startBlock, endBlock);
+  if (rangeError) return rangeError;
+  const callerError = validateCaller(caller);
+  if (callerError) return callerError;
+
   const hasTxCallers = hasTable("tx_callers");
 
   // Build WHERE clauses for optional block range filtering
@@ -871,7 +1282,7 @@ function handleDfgSignatures(url: URL): Response {
     fromClause = `FROM ${txsFrom}
       JOIN tx_callers c
         ON c.chain_id = t.chain_id AND c.tx_hash = t.tx_hash AND c.caller = $callerLower`;
-    params.$callerLower = caller.toLowerCase();
+    params.$callerLower = caller;
   } else if (caller) {
     whereClauses.push(
       `EXISTS (
@@ -883,7 +1294,7 @@ function handleDfgSignatures(url: URL): Response {
          LIMIT 1
        )`,
     );
-    params.$callerLower = caller.toLowerCase();
+    params.$callerLower = caller;
   }
 
   const whereClause = whereClauses.join(" AND ");
@@ -939,13 +1350,19 @@ function handleDfgSignatures(url: URL): Response {
 }
 
 function handleDfgStats(url: URL): Response {
-  const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainId = parseInteger(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainIdError = validateIntParam(chainId, "chainId", 0, maxChainId);
+  if (chainIdError) return chainIdError;
   const includeDeps = url.searchParams.get("includeDeps") === "1";
-  const startBlock = parseNumber(url.searchParams.get("startBlock"));
-  const endBlock = parseNumber(url.searchParams.get("endBlock"));
+  const startBlock = parseInteger(url.searchParams.get("startBlock"));
+  const endBlock = parseInteger(url.searchParams.get("endBlock"));
   const depthModeParam = url.searchParams.get("depthMode");
   const depthMode: "inter" | "total" = depthModeParam === "total" ? "total" : "inter";
   const signatureHash = url.searchParams.get("signatureHash") ?? undefined;
+  const rangeError = validateBlockRange(startBlock, endBlock);
+  if (rangeError) return rangeError;
+  const signatureHashError = validateSignatureHash(signatureHash);
+  if (signatureHashError) return signatureHashError;
 
   if (chainId === undefined) {
     return jsonResponse({ error: "chain_id_required" }, 400);
@@ -1374,7 +1791,9 @@ function handleDfgStats(url: URL): Response {
 }
 
 function handleDfgRollup(url: URL): Response {
-  const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainId = parseInteger(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainIdError = validateIntParam(chainId, "chainId", 0, maxChainId);
+  if (chainIdError) return chainIdError;
   if (chainId === undefined) {
     return jsonResponse({ error: "chain_id_required" }, 400);
   }
@@ -1407,7 +1826,9 @@ function handleDfgRollup(url: URL): Response {
 }
 
 function handleDfgExport(url: URL): Response {
-  const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainId = parseInteger(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainIdError = validateIntParam(chainId, "chainId", 0, maxChainId);
+  if (chainIdError) return chainIdError;
   if (chainId === undefined) {
     return jsonResponse({ error: "chain_id_required" }, 400);
   }
@@ -1452,9 +1873,15 @@ function handleDfgExport(url: URL): Response {
 }
 
 function handleDfgStatsHorizon(url: URL): Response {
-  const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
-  const horizonSize = parseNumber(url.searchParams.get("horizonSize"), 10) ?? 10;
+  const chainId = parseInteger(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainIdError = validateIntParam(chainId, "chainId", 0, maxChainId);
+  if (chainIdError) return chainIdError;
+  const horizonSize = parseInteger(url.searchParams.get("horizonSize")) ?? 10;
   const signatureHash = url.searchParams.get("signatureHash") ?? undefined;
+  const horizonSizeError = validateIntParam(horizonSize, "horizonSize", 1, maxHorizonSize);
+  if (horizonSizeError) return horizonSizeError;
+  const signatureHashError = validateSignatureHash(signatureHash);
+  if (signatureHashError) return signatureHashError;
 
   if (chainId === undefined) {
     return jsonResponse({ error: "chain_id_required" }, 400);
@@ -1533,9 +1960,13 @@ function handleDfgStatsHorizon(url: URL): Response {
 }
 
 function handleDfgPattern(url: URL): Response {
-  const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainId = parseInteger(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainIdError = validateIntParam(chainId, "chainId", 0, maxChainId);
+  if (chainIdError) return chainIdError;
   const signatureHash = url.searchParams.get("signatureHash");
-  const exampleLimit = parseNumber(url.searchParams.get("exampleLimit"), 5) ?? 5;
+  const exampleLimit = parseInteger(url.searchParams.get("exampleLimit")) ?? 5;
+  const exampleLimitError = validateIntParam(exampleLimit, "exampleLimit", 1, maxExampleLimit);
+  if (exampleLimitError) return exampleLimitError;
 
   if (chainId === undefined) {
     return jsonResponse({ error: "chain_id_required" }, 400);
@@ -1543,6 +1974,8 @@ function handleDfgPattern(url: URL): Response {
   if (!signatureHash) {
     return jsonResponse({ error: "signature_hash_required" }, 400);
   }
+  const signatureHashError = validateSignatureHash(signatureHash);
+  if (signatureHashError) return signatureHashError;
   if (!hasTable("dfg_tx_deps") || !hasTable("dfg_txs")) {
     return jsonResponse({ error: "dfg_tables_missing" }, 404);
   }
@@ -1619,12 +2052,22 @@ function handleDfgPattern(url: URL): Response {
 }
 
 function handleDfgStatsWindow(url: URL): Response {
-  const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
-  const lookbackBlocks = parseNumber(url.searchParams.get("lookbackBlocks"), 50) ?? 50;
+  const chainId = parseInteger(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainIdError = validateIntParam(chainId, "chainId", 0, maxChainId);
+  if (chainIdError) return chainIdError;
+  const lookbackBlocks = parseInteger(url.searchParams.get("lookbackBlocks")) ?? 50;
   const signatureHash = url.searchParams.get("signatureHash") ?? undefined;
-  const topLimit = parseNumber(url.searchParams.get("topLimit"), 10) ?? 10;
-  const startBlockParam = parseNumber(url.searchParams.get("startBlock"));
-  const endBlockParam = parseNumber(url.searchParams.get("endBlock"));
+  const topLimit = parseInteger(url.searchParams.get("topLimit")) ?? 10;
+  const startBlockParam = parseInteger(url.searchParams.get("startBlock"));
+  const endBlockParam = parseInteger(url.searchParams.get("endBlock"));
+  const lookbackError = validateIntParam(lookbackBlocks, "lookbackBlocks", 1, maxWindowLookback);
+  if (lookbackError) return lookbackError;
+  const topLimitError = validateIntParam(topLimit, "topLimit", 1, maxTopLimit);
+  if (topLimitError) return topLimitError;
+  const initialRangeError = validateBlockRange(startBlockParam, endBlockParam);
+  if (initialRangeError) return initialRangeError;
+  const signatureHashError = validateSignatureHash(signatureHash);
+  if (signatureHashError) return signatureHashError;
 
   if (chainId === undefined) {
     return jsonResponse({ error: "chain_id_required" }, 400);
@@ -1648,6 +2091,8 @@ function handleDfgStatsWindow(url: URL): Response {
       endBlock = resolvedEnd;
     }
   }
+  const resolvedRangeError = validateBlockRange(startBlock, endBlock);
+  if (resolvedRangeError) return resolvedRangeError;
 
   // Get transactions with their blocks and intra-tx depth (with optional block range filtering)
   const txClauses = ["t.chain_id = $chainId"];
@@ -1968,11 +2413,20 @@ function handleDfgStatsWindow(url: URL): Response {
 }
 
 function handleDfgStatsBySignature(url: URL): Response {
-  const chainId = parseNumber(url.searchParams.get("chainId")) ?? defaultChainId;
-  const limit = parseNumber(url.searchParams.get("limit"), 20) ?? 20;
-  const startBlock = parseNumber(url.searchParams.get("startBlock"));
-  const endBlock = parseNumber(url.searchParams.get("endBlock"));
+  const chainId = parseInteger(url.searchParams.get("chainId")) ?? defaultChainId;
+  const chainIdError = validateIntParam(chainId, "chainId", 0, maxChainId);
+  if (chainIdError) return chainIdError;
+  const limit = parseInteger(url.searchParams.get("limit")) ?? 20;
+  const startBlock = parseInteger(url.searchParams.get("startBlock"));
+  const endBlock = parseInteger(url.searchParams.get("endBlock"));
   const orderBy = url.searchParams.get("orderBy") ?? "frequency";
+  const limitError = validateIntParam(limit, "limit", 1, maxPageLimit);
+  if (limitError) return limitError;
+  const rangeError = validateBlockRange(startBlock, endBlock);
+  if (rangeError) return rangeError;
+  if (orderBy !== "frequency" && orderBy !== "maxDepth") {
+    return jsonResponse({ error: "invalid_order_by" }, 400);
+  }
 
   if (chainId === undefined) {
     return jsonResponse({ error: "chain_id_required" }, 400);
@@ -2047,79 +2501,107 @@ function handleDfgStatsBySignature(url: URL): Response {
 }
 
 Bun.serve({
+  hostname: host,
   port,
   fetch(req) {
     const url = new URL(req.url);
+    const apiPathname = isApiPath(url.pathname);
+
+    if (apiPathname && req.method === "OPTIONS") {
+      return finalizeResponse(req, url, handlePreflight(req, url), true);
+    }
+
+    if (apiPathname && req.method !== "GET" && req.method !== "HEAD") {
+      const methodNotAllowed = jsonResponse({ error: "method_not_allowed" }, 405);
+      methodNotAllowed.headers.set("allow", "GET, HEAD, OPTIONS");
+      return finalizeResponse(req, url, methodNotAllowed, true);
+    }
+
+    if (apiPathname) {
+      const rateLimitResult = isRateLimited(req, url.pathname);
+      if (rateLimitResult.limited) {
+        const limited = jsonResponse(
+          {
+            error: "rate_limited",
+            retryAfterSeconds: rateLimitResult.retryAfterSeconds,
+          },
+          429,
+        );
+        limited.headers.set("retry-after", String(rateLimitResult.retryAfterSeconds));
+        return finalizeResponse(req, url, limited, true);
+      }
+    }
+
+    let response: Response;
     switch (url.pathname) {
       case "/health":
-        return handleHealth();
+        response = handleHealth();
+        break;
       case "/stats/ops":
-        return handleOps(url);
+        response = handleOps(url);
+        break;
       case "/stats/summary":
-        return handleSummary(url);
+        response = handleSummary(url);
+        break;
       case "/stats/buckets":
-        return handleBuckets(url);
+        response = handleBuckets(url);
+        break;
       case "/stats/types":
-        return handleTypes(url);
+        response = handleTypes(url);
+        break;
       case "/stats/op-types":
-        return handleOpTypes(url);
+        response = handleOpTypes(url);
+        break;
       case "/stats/ingestion":
-        return handleIngestion(url);
+        response = handleIngestion(url);
+        break;
       case "/stats/db":
-        return handleDbStats();
+        response = exposeDbStats ? handleDbStats() : jsonResponse({ error: "not_found" }, 404);
+        break;
       case "/dfg/txs":
-        return handleDfgTxs(url);
+        response = handleDfgTxs(url);
+        break;
       case "/dfg/tx":
-        return handleDfgTx(url);
+        response = handleDfgTx(url);
+        break;
       case "/dfg/signatures":
-        return handleDfgSignatures(url);
+        response = handleDfgSignatures(url);
+        break;
       case "/dfg/stats":
-        return handleDfgStats(url);
+        response = handleDfgStats(url);
+        break;
       case "/dfg/rollup":
-        return handleDfgRollup(url);
+        response = handleDfgRollup(url);
+        break;
       case "/dfg/export":
-        return handleDfgExport(url);
+        response = handleDfgExport(url);
+        break;
       case "/dfg/stats/horizon":
-        return handleDfgStatsHorizon(url);
+        response = handleDfgStatsHorizon(url);
+        break;
       case "/dfg/stats/by-signature":
-        return handleDfgStatsBySignature(url);
+        response = handleDfgStatsBySignature(url);
+        break;
       case "/dfg/stats/window":
-        return handleDfgStatsWindow(url);
+        response = handleDfgStatsWindow(url);
+        break;
       case "/dfg/pattern":
-        return handleDfgPattern(url);
-      default:
+        response = handleDfgPattern(url);
+        break;
+      default: {
         if (req.method === "GET" || req.method === "HEAD") {
           const uiResponse = tryServeUi(url.pathname);
-          if (uiResponse) return uiResponse;
+          if (uiResponse) {
+            response = uiResponse;
+            break;
+          }
         }
-        return jsonResponse(
-          {
-            error: "not_found",
-            routes: [
-              "/health",
-              "/stats/summary",
-              "/stats/ops",
-              "/stats/buckets",
-              "/stats/types",
-              "/stats/op-types",
-              "/stats/ingestion",
-              "/stats/db",
-              "/dfg/txs",
-              "/dfg/tx",
-              "/dfg/signatures",
-              "/dfg/stats",
-              "/dfg/stats/horizon",
-              "/dfg/stats/by-signature",
-              "/dfg/stats/window",
-              "/dfg/pattern",
-              "/dfg/rollup",
-              "/dfg/export",
-            ],
-          },
-          404,
-        );
+        response = jsonResponse({ error: "not_found" }, 404);
+      }
     }
+
+    return finalizeResponse(req, url, response, apiPathname);
   },
 });
 
-console.log(`fhevm-stats API listening on http://localhost:${port}`);
+console.log(`fhevm-stats API listening on http://${host}:${port}`);

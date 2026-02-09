@@ -68,7 +68,7 @@ Lightweight FHEVM host-chain stats collector.
 - `GET /stats/types?chainId=&startBlock=&endBlock=&role=`
 - `GET /stats/op-types?chainId=&startBlock=&endBlock=&eventName=&role=&includeScalar=`
 - `GET /stats/ingestion?chainId=`
-- `GET /stats/db`
+- `GET /stats/db` (disabled by default; enable with `EXPOSE_DB_STATS=1`)
 - `GET /dfg/txs?chainId=&limit=&offset=&minNodes=`
 - `GET /dfg/tx?chainId=&txHash=`
 - `GET /dfg/signatures?chainId=&limit=&offset=`
@@ -111,6 +111,16 @@ explicit event fields (`VerifyInput`, `Cast`, `TrivialEncrypt`, `FheRand*`).
 - ROLLUP_BLOCK_FETCH_DELAY_MS (rollup:ops; per-block RPC delay, default 200ms)
 - DB_PATH
 - MODE (backfill | stream | both)
+- HTTP_PORT / HTTP_HOST (`127.0.0.1` by default)
+- CORS_ALLOW_ORIGINS (comma-separated allowlist; same-origin always allowed)
+- EXPOSE_DB_STATS (`1` to enable `GET /stats/db`)
+
+Security hardening knobs:
+- RATE_LIMIT_WINDOW_MS / RATE_LIMIT_MAX_REQUESTS / RATE_LIMIT_DISABLED
+- MAX_PAGE_LIMIT / MAX_PAGE_OFFSET
+- MAX_BLOCK_SPAN / MAX_WINDOW_LOOKBACK / MAX_TOP_LIMIT
+- MAX_EXAMPLE_LIMIT / MAX_HORIZON_SIZE / MAX_BUCKET_SIZE
+- MAX_EVENT_NAME_LENGTH
 
 Multi-network notes:
 - Use `NETWORK=sepolia,mainnet` and set `SEPOLIA_ETH_RPC_URL` + `MAINNET_ETH_RPC_URL`.
