@@ -24,8 +24,13 @@ const DEFAULT_MAX_BLOCK_NUMBER = 9_999_999_999;
 
 const dbPath = Bun.env.DB_PATH ?? DEFAULT_DB_PATH;
 const defaultChainId = parseNumber(Bun.env.CHAIN_ID);
-const port = Math.max(1, Math.trunc(parseNumber(Bun.env.HTTP_PORT, DEFAULT_PORT) ?? DEFAULT_PORT));
-const host = Bun.env.HTTP_HOST ?? DEFAULT_HOST;
+const isPlatformDeployment =
+  (Bun.env.RAILWAY_ENVIRONMENT ?? "").trim().length > 0 || (Bun.env.PORT ?? "").trim().length > 0;
+const port = Math.max(
+  1,
+  Math.trunc(parseNumber(Bun.env.HTTP_PORT ?? Bun.env.PORT, DEFAULT_PORT) ?? DEFAULT_PORT),
+);
+const host = (Bun.env.HTTP_HOST ?? "").trim() || (isPlatformDeployment ? "0.0.0.0" : DEFAULT_HOST);
 const exposeDbStats = Bun.env.EXPOSE_DB_STATS === "1";
 const maxPageOffset = Math.max(
   0,

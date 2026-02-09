@@ -111,7 +111,7 @@ explicit event fields (`VerifyInput`, `Cast`, `TrivialEncrypt`, `FheRand*`).
 - ROLLUP_BLOCK_FETCH_DELAY_MS (rollup:ops; per-block RPC delay, default 200ms)
 - DB_PATH
 - MODE (backfill | stream | both)
-- HTTP_PORT / HTTP_HOST (`127.0.0.1` by default)
+- HTTP_PORT / HTTP_HOST (`HTTP_PORT` falls back to `PORT`; host defaults to `127.0.0.1` locally and `0.0.0.0` on platform deploys)
 - CORS_ALLOW_ORIGINS (comma-separated allowlist; same-origin always allowed)
 - EXPOSE_DB_STATS (`1` to enable `GET /stats/db`)
 
