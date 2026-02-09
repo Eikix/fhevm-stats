@@ -1,0 +1,6 @@
+[build]
+builder = "NIXPACKS"
+buildCommand = "bun install && (cd ui && bun install && bun run build)"
+
+[deploy]
+startCommand = "bash scripts/railway-start.sh"
