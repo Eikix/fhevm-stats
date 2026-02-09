@@ -1580,18 +1580,27 @@ function App() {
         ? "border-amber-200 bg-amber-50 text-amber-700"
         : "border-emerald-200 bg-emerald-50 text-emerald-700";
 
-  const ingestionAge = useMemo(() => {
-    if (!ingestion?.events.lastEventAt || ingestionStatus !== "ready")
+  const ingestionCheckpointAge = useMemo(() => {
+    if (!ingestion?.checkpoint.updatedAt || ingestionStatus !== "ready") {
       return null;
+    }
+    return (
+      Date.now() -
+      new Date(normalizeTimestamp(ingestion.checkpoint.updatedAt)).getTime()
+    );
+  }, [ingestion?.checkpoint.updatedAt, ingestionStatus]);
+  const ingestionEventAge = useMemo(() => {
+    if (!ingestion?.events.lastEventAt || ingestionStatus !== "ready") {
+      return null;
+    }
     return (
       Date.now() -
       new Date(normalizeTimestamp(ingestion.events.lastEventAt)).getTime()
     );
   }, [ingestion?.events.lastEventAt, ingestionStatus]);
+  const ingestionAge = ingestionCheckpointAge ?? ingestionEventAge;
   const ingestionStale =
-    ingestionAge === null
-      ? true
-      : ingestionAge > 5 * 60 * 1000 || (ingestion?.events.count ?? 0) === 0;
+    ingestionAge === null ? true : ingestionAge > 5 * 60 * 1000;
   const ingestionBadge =
     ingestionStatus === "error"
       ? "border-red-200 bg-red-50 text-red-700"
@@ -1685,8 +1694,14 @@ function App() {
               </span>
               {ingestionStatus === "ready" ? (
                 <span className="muted-text text-xs uppercase tracking-[0.18em]">
-                  Last event {formatRelativeTime(ingestion?.events.lastEventAt)}{" "}
-                  · block {formatNumber(ingestion?.events.maxBlock)}
+                  Checkpoint{" "}
+                  {formatRelativeTime(ingestion?.checkpoint.updatedAt)} · block{" "}
+                  {formatNumber(ingestion?.checkpoint.lastBlock)}
+                  {ingestion?.events.lastEventAt
+                    ? ` · last event ${formatRelativeTime(
+                        ingestion.events.lastEventAt,
+                      )}`
+                    : ""}
                 </span>
               ) : ingestionStatus === "error" ? (
                 <span className="muted-text text-xs uppercase tracking-[0.18em]">
