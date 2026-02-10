@@ -229,7 +229,7 @@ type PieSegment = {
   color: string;
 };
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:4310";
+const API_BASE = import.meta.env.VITE_API_BASE?.trim() ?? "";
 const NETWORKS: NetworkOption[] = [
   { id: "mainnet", label: "Mainnet", chainId: 1 },
   { id: "sepolia", label: "Sepolia", chainId: 11155111 },
